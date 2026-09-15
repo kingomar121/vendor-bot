@@ -1,128 +1,181 @@
-const { Telegraf, Markup } = require('telegraf');
-const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
-const bodyParser = require('body-parser');
-const axios = require('axios');
+const { Telegraf } = require('telegraf');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
 
-// ENV - Will be set in Render
-const BOT_TOKEN = process.env.BOT_TOKEN || '8992764491:AAEApP039MVxGBnLFpLrKSUwq8mqpUQGwxU';
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = process.env.ADMIN_ID || '8030671133';
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
-const ADMIN_ID = process.env.ADMIN_ID || '8030671133';
-const NOWPAYMENTS_API_KEY = process.env.NOWPAYMENTS_API_KEY;
-const NOWPAYMENTS_IPN_SECRET = process.env.NOWPAYMENTS_IPN_SECRET;
+const PORT = process.env.PORT || 10000;
 
-if (!SUPABASE_URL || !SUPABASE_KEY) {
-  console.log('⚠️ Supabase not set yet - will use env on Render');
+// Supabase Client
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_KEY) {
+  supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+  console.log('Supabase Connected');
+} else {
+  console.log('Supabase not set - using temporary memory');
 }
 
-const supabase = SUPABASE_URL ? createClient(SUPABASE_URL, SUPABASE_KEY) : null;
+// In-memory fallback
+let vendorsMemory = {};
+
 const bot = new Telegraf(BOT_TOKEN);
 
-// Express for NOWPayments webhook
-app.get('/', (req, res) => res.send('Vendor Bot Running ✅'));
-app.post('/webhook/nowpayments', async (req, res) => {
-  console.log('IPN:', req.body);
-  // Verify & update payment status here
-  res.sendStatus(200);
-});
+// ============ HELPER FUNCTIONS ============
 
-// START
-bot.start(async (ctx) => {
-  const userId = ctx.from.id.toString();
-  const username = ctx.from.username || '';
+async function getVendor(telegram_id) {
+  if (supabase) {
+    const { data } = await supabase.from('vendors').select('*').eq('telegram_id', telegram_id).single();
+    return data;
+  } else {
+    return vendorsMemory[telegram_id] || null;
+  }
+}
+
+async function createVendor(telegram_id, data = {}) {
+  const vendor = {
+    telegram_id: String(telegram_id),
+    shop_name: data.shop_name || null,
+    whatsapp: data.whatsapp || null,
+    category: data.category || null,
+    plan: 'free',
+    product_count: 0,
+    daily_visits: 0,
+    last_visit_date: new Date().toDateString(),
+    status: 'approved',
+    link_status: 'Active',
+    delivery_fee: data.delivery_fee || null,
+    account_no: data.account_no || null,
+    created_at: new Date().toISOString()
+  };
+  if (supabase) {
+    await supabase.from('vendors').upsert(vendor);
+  } else {
+    vendorsMemory[telegram_id] = vendor;
+  }
+  return vendor;
+}
+
+async function checkAndUpdateLimit(telegram_id) {
+  let vendor = await getVendor(telegram_id);
+  if (!vendor) {
+    vendor = await createVendor(telegram_id);
+  }
+  // Reset daily if new day
+  const today = new Date().toDateString();
+  if (vendor.last_visit_date !== today) {
+    vendor.daily_visits = 0;
+    vendor.last_visit_date = today;
+  }
   
-  if (supabase) {
-    await supabase.from('vendors').upsert({
-      telegram_id: userId,
-      username: username,
-      last_seen: new Date().toISOString()
-    }, { onConflict: 'telegram_id' });
+  // FREE = 10 DMs per day
+  if (vendor.plan === 'free' && vendor.daily_visits >= 10) {
+    return { allowed: false, vendor };
   }
-
-  await ctx.reply(
-    `👑 Welcome to CityLords Vendor System\n\nID: ${userId}\nUse /register to become a vendor\nUse /shop to browse shops\nUse /admin if you are admin`,
-    Markup.keyboard([['/register', '/shop'], ['/profile', '/help']]).resize()
-  );
-});
-
-// REGISTER VENDOR
-bot.command('register', async (ctx) => {
-  await ctx.reply('🏪 Send your Shop Name:');
-  bot.on('text', async (ctx2) => {
-    if (ctx2.message.text.startsWith('/')) return;
-    const shopName = ctx2.message.text;
-    const userId = ctx2.from.id.toString();
-    
-    if (supabase) {
-      const { error } = await supabase.from('vendors').upsert({
-        telegram_id: userId,
-        shop_name: shopName,
-        username: ctx2.from.username,
-        status: 'pending',
-        created_at: new Date().toISOString()
-      }, { onConflict: 'telegram_id' });
-      
-      if (error) return ctx2.reply('Error: ' + error.message);
-    }
-    
-    await ctx2.reply(`✅ Shop "${shopName}" registered!\nWaiting for admin approval.\nAdmin ID: ${ADMIN_ID}`);
-    try {
-      await bot.telegram.sendMessage(ADMIN_ID, `🔔 New Vendor Request:\nShop: ${shopName}\nID: ${userId}\nUsername: @${ctx2.from.username}\n\n/approve ${userId}`);
-    } catch(e){}
-  });
-});
-
-// SHOP
-bot.command('shop', async (ctx) => {
-  if (!supabase) return ctx.reply('Supabase not connected yet');
-  const { data } = await supabase.from('vendors').select('*').eq('status', 'approved');
-  if (!data || data.length === 0) return ctx.reply('No shops yet');
-  let msg = '🏬 Approved Shops:\n\n';
-  data.forEach(v => { msg += `• ${v.shop_name} - @${v.username}\n`; });
-  await ctx.reply(msg);
-});
-
-// ADMIN APPROVE
-bot.command('approve', async (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.reply('Not admin');
-  const idToApprove = ctx.message.text.split(' ')[1];
-  if (!idToApprove) return ctx.reply('Usage: /approve TELEGRAM_ID');
+  
+  vendor.daily_visits += 1;
   if (supabase) {
-    await supabase.from('vendors').update({ status: 'approved' }).eq('telegram_id', idToApprove);
+    await supabase.from('vendors').update({ daily_visits: vendor.daily_visits, last_visit_date: today }).eq('telegram_id', String(telegram_id));
+  } else {
+    vendorsMemory[telegram_id] = vendor;
   }
-  await ctx.reply(`✅ Approved ${idToApprove}`);
-  try { await bot.telegram.sendMessage(idToApprove, '🎉 Your shop has been APPROVED! Use /shop'); } catch(e){}
+  return { allowed: true, vendor };
+}
+
+// ============ BOT COMMANDS ============
+
+bot.start(async (ctx) => {
+  const id = String(ctx.from.id);
+  let vendor = await getVendor(id);
+  if (!vendor) vendor = await createVendor(id);
+  
+  ctx.reply(`👋 Welcome to CityLords Vendor Assistant!
+
+PROJECT: Vendor Assistant
+
+Your Shop: ${vendor.shop_name || 'Not set yet'}
+Plan: ${vendor.plan.toUpperCase()} ${vendor.plan === 'free' ? '(10 DMs/day, 1 Product)' : '(Unlimited)'}
+
+Commands:
+/plan - Check your plan & upgrade
+/addproduct - Add product with [+ Add Item] logic
+/myproducts - View products
+/admin - (Admin only) Generate vendor links
+
+To register new vendor via link, ask Admin for link.`);
 });
 
-bot.command('admin', (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return ctx.reply('Not admin');
-  ctx.reply('👑 Admin Panel\n/approve ID - approve vendor\n/vendors - list vendors', Markup.keyboard([['/vendors']]).resize());
+bot.command('plan', async (ctx) => {
+  const vendor = await getVendor(String(ctx.from.id));
+  if (!vendor) return ctx.reply('Send /start first');
+  
+  ctx.reply(`📊 YOUR PLAN
+
+Shop: ${vendor.shop_name || 'Not set'}
+Category: ${vendor.category || 'Not set'}
+Plan: ${vendor.plan.toUpperCase()}
+Products: ${vendor.product_count}/ ${vendor.plan === 'free' ? '1 (FREE)' : '20 (PAID)'}
+DMs Today: ${vendor.daily_visits}/ ${vendor.plan === 'free' ? '10 (FREE)' : 'Unlimited (PAID)'}
+
+FREE: 10 DMs/day, 1 Product
+PAID: N2000/month - Unlimited DMs + 20 Products
+
+To upgrade, contact Admin: @CityLords
+Your ADMIN_ID: ${ctx.from.id}`, 
+  { reply_markup: { inline_keyboard: [[{ text: 'Upgrade to PAID N2000', callback_data: 'upgrade' }]] } });
 });
 
-bot.command('vendors', async (ctx) => {
-  if (ctx.from.id.toString() !== ADMIN_ID) return;
-  if (!supabase) return ctx.reply('No DB');
-  const { data } = await supabase.from('vendors').select('*');
-  let msg = 'Vendors:\n';
-  data?.forEach(v => msg += `${v.shop_name} | ${v.telegram_id} | ${v.status}\n`);
-  ctx.reply(msg || 'None');
+bot.command('addproduct', async (ctx) => {
+  const vendor = await getVendor(String(ctx.from.id));
+  if (!vendor) return ctx.reply('Send /start first');
+  
+  if (vendor.plan === 'free' && vendor.product_count >= 1) {
+    return ctx.reply('⛔ FREE LIMIT: Only 1 product.\nUpgrade to PAID N2000 to add up to 20 products.\nSend /plan to upgrade.');
+  }
+  if (vendor.product_count >= 20) {
+    return ctx.reply('⛔ MAX 20 products reached.');
+  }
+  
+  ctx.reply(`➕ ADD ITEM (Button Logic)
+
+Category: ${vendor.category || 'Not set - register first via link'}
+
+Send product like this:
+Name - Price
+Example: Nike Air Max - 25000
+
+For Fashion/Shoes: Add Color, Size with ticks
+For Phones/Electronics: Add Brand/Model
+For Used Items: Name + Price only
+
+Max: ${vendor.plan === 'free' ? '1 (FREE)' : '20 (PAID)'}
+Current: ${vendor.product_count}
+
+Use [+ Add Item] in dashboard for better UX: /dashboard`);
 });
 
-bot.command('profile', async (ctx) => {
-  const userId = ctx.from.id.toString();
-  if (!supabase) return ctx.reply(`ID: ${userId}`);
-  const { data } = await supabase.from('vendors').select('*').eq('telegram_id', userId).single();
-  if (!data) return ctx.reply('Not registered. Use /register');
-  ctx.reply(`🏪 Shop: ${data.shop_name}\nStatus: ${data.status}\nID: ${data.telegram_id}`);
+bot.on('text', async (ctx) => {
+  if (ctx.message.text.startsWith('/')) return;
+  
+  const check = await checkAndUpdateLimit(String(ctx.from.id));
+  if (!check.allowed) {
+    return ctx.reply('⛔ FREE DAILY LIMIT REACHED: 10 DMs/day.\nYou have used 10/10 today.\n\nUpgrade to PAID N2000 for unlimited replies 24/7.\nSend /plan');
+  }
+  
+  // Here you add AI auto-reply logic later
+  // For now, just acknowledge
+  ctx.reply(`✅ Auto-Reply (${check.vendor.daily_visits}/10 today)\n\nYou said: ${ctx.message.text}\n\n[Bot would reply to customer here 24/7]`);
 });
 
-bot.command('help', (ctx) => {
-  ctx.reply('/start - start\n/register - register shop\n/shop - view shops\n/profile - my shop\n/help - this');
+// ============ EXPRESS ROUTES - ADMIN + VENDOR LINK SYSTEM ============
+
+app.get('/', (req, res) => {
+  res.send(`<h1>CityLords Vendor Assistant Live ✅</h1><p>Bot running</p><p>Admin: <a href="/admin?admin=${ADMIN_ID}">/admin?admin=${ADMIN_ID}</a></p>`);
 });
 
-bot.launch().then(() => console.log('Bot started'));
-app.listen(process.env.PORT || 3000, () => console.log('Server running'));
+// ADMIN PAGE - CityLords Admin Only
