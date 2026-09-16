@@ -14,6 +14,16 @@ const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL || '';
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const bot = new Telegraf(BOT_TOKEN);
+const lastStart = new Map();
+bot.use((ctx, next) => {
+  if (ctx.message?.text?.startsWith('/start')) {
+    const id = String(ctx.from.id);
+    const now = Date.now();
+    if (lastStart.has(id) && now - lastStart.get(id) < 3000) return;
+    lastStart.set(id, now);
+  }
+  return next();
+});
 
 function normalizeWa(raw) {
   let d = String(raw).replace(/[^0-9]/g, '');
