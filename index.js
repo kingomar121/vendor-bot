@@ -28,46 +28,62 @@ if (SUPABASE_URL && SUPABASE_KEY) {
 }
 
 let vendorsMemory = {};
-let onboarding = {}; // NEW: For vendor onboarding flow
+let onboarding = {};
 const bot = BOT_TOKEN? new Telegraf(BOT_TOKEN) : null;
 
-👋 Welcome to CityLords Vendor Assistant!
-
-Your Shop: Not set yet
-Plan: FREE (10 DMs/day, 1 Product)
-
-Commands:
-/plan - Check your plan & upgrade
-/addproduct - Add product with [+ Add Item] logic
-/myproducts - View products
-  if (supabase) {
-    const { data } = await supabase.from('vendors').select('*').eq('telegram_id', telegram_id).single();
-    return data;
-  } else {
-    return vendorsMemory[telegram_id] || null;
+// ===== FIXED FUNCTIONS - SIMPLE =====
+async function getVendor(telegram_id) {
+  try {
+    if (supabase) {
+      const { data, error } = await supabase.from('vendors').select('*').eq('telegram_id', String(telegram_id)).maybeSingle();
+      if (error) console.log('getVendor error:', error.message);
+      return data || null;
+    } else {
+      return vendorsMemory[String(telegram_id)] || null;
+    }
+  } catch (e) {
+    console.log('getVendor catch:', e.message);
+    return vendorsMemory[String(telegram_id)] || null;
   }
 }
 
 async function createVendor(telegram_id, data = {}) {
+  const idStr = String(telegram_id);
+  let existing = await getVendor(idStr);
   const vendor = {
-    telegram_id: String(telegram_id),
-    shop_name: data.shop_name || null,
-    whatsapp: data.whatsapp || null,
-    category: data.category || null,
-    plan: 'free',
-    product_count: data.product_count || 0,
-    daily_visits: 0,
-    last_visit_date: new Date().toDateString(),
+    telegram_id: idStr,
+    shop_name: data.shop_name || existing?.shop_name || null,
+    whatsapp: data.whatsapp || existing?.whatsapp || null,
+    category: data.category || existing?.category || null,
+    plan: existing?.plan || 'free',
+    product_count: data.product_count?? existing?.product_count?? 0,
+    daily_visits: existing?.daily_visits || 0,
+    last_visit_date: existing?.last_visit_date || new Date().toDateString(),
     status: 'approved',
     link_status: 'Active',
-    delivery_fee: data.delivery_fee || null,
-    account_no: data.account_no || null,
-    created_at: new Date().toISOString()
+    delivery_fee: data.delivery_fee || existing?.delivery_fee || null,
+    account_no: data.account_no || existing?.account_no || null,
+    created_at: existing?.created_at || new Date().toISOString()
   };
+  console.log('Saving vendor:', vendor.shop_name, vendor.product_count);
   if (supabase) {
-    await supabase.from('vendors').upsert(vendor);
+    const { error } = await supabase.from('vendors').upsert(vendor, { onConflict: 'telegram_id' });
+    if (error) {
+      console.log('Vendor upsert FAILED:', error.message);
+      vendorsMemory[idStr] = vendor;
+    }
+    if (data.raw_products && Array.isArray(data.raw_products) && data.raw_products.length > 0) {
+      for (let p of data.raw_products) {
+        let parts = p.split('-');
+        let name = parts[0]?.trim();
+        let price = parts[1]?.trim() || '0';
+        if (name) {
+          await supabase.from('products').insert({ vendor_id: idStr, name: name, price: price }).then(({error})=>{if(error) console.log('Product error', error.message)});
+        }
+      }
+    }
   } else {
-    vendorsMemory[telegram_id] = vendor;
+    vendorsMemory[idStr] = {...vendor, raw_products: data.raw_products };
   }
   return vendor;
 }
@@ -93,24 +109,25 @@ async function checkAndUpdateLimit(telegram_id) {
 }
 
 if (bot) {
-  // ===== FIX 1: NEW bot.start WITH PAYLOAD HANDLING =====
   bot.start(async (ctx) => {
     const id = String(ctx.from.id);
-    const payload = ctx.startPayload; // Gets vendor123 from link
+    const payload = ctx.startPayload;
     console.log('Start payload:', payload, 'from', id);
 
-    // Vendor clicked invite link https://t.me/CityLordsBot?start=vendor123
     if (payload === 'vendor123') {
       onboarding[id] = { step: 'business_name', data: {} };
       return ctx.reply(`👋 Welcome to CityLords! 🎉\n\nLet's create your store quickly.\n\nWhat is your business name?`);
     }
-
-    // Customer clicked vendor unique link e.g?start=ShopName
     if (payload && payload!== 'vendor123') {
+      let v = null;
+      if (supabase) {
+        const { data } = await supabase.from('vendors').select('*').ilike('shop_name', `%${payload}%`).maybeSingle();
+        v = data;
+      }
+      if (v) return ctx.reply(`Welcome to ${v.shop_name} store! 🛒\nCategory: ${v.category}\nWhatsApp: ${v.whatsapp}\nProducts: ${v.product_count}\n\nContact vendor directly.`);
       return ctx.reply(`Welcome to ${payload} store! 🛒\nProducts loading soon...\n\nType /start to create your own store.`);
     }
 
-    // Normal start
     let vendor = await getVendor(id);
     if (!vendor) vendor = await createVendor(id);
     ctx.reply(`👋 Welcome to CityLords Vendor Assistant!
@@ -142,56 +159,44 @@ PAID: N2000/month - Unlimited DMs + 20 Products`);
   bot.command('addproduct', async (ctx) => {
     const vendor = await getVendor(String(ctx.from.id));
     if (!vendor) return ctx.reply('Send /start first');
-    if (vendor.plan === 'free' && vendor.product_count >= 1) {
-      return ctx.reply('⛔ FREE LIMIT: Only 1 product. Upgrade to PAID N2000');
-    }
     ctx.reply(`➕ Send product like: Name - Price\nExample: Nike Air Max - 25000`);
   });
 
-  // ===== FIX 2 & 3: NEW bot.on text WITH FULL FLOW =====
   bot.on('text', async (ctx) => {
     const id = String(ctx.from.id);
     const text = ctx.message.text;
     if (text.startsWith('/')) return;
 
-    // ONBOARDING FLOW FOR NEW VENDORS
     if (onboarding[id]) {
       const state = onboarding[id];
-
       if (state.step === 'business_name') {
         state.data.shop_name = text;
         state.step = 'whatsapp';
         return ctx.reply(`Great! "${text}" ✅\n\nWhat is your WhatsApp number?`);
       }
-
       if (state.step === 'whatsapp') {
         state.data.whatsapp = text;
         state.step = 'category';
         return ctx.reply(`Thanks!\n\nWhat is your category?\nOptions: Fashion / Electronics / Used Items / Phones / Shoes / Others`);
       }
-
       if (state.step === 'category') {
         state.data.category = text;
         state.step = 'products';
         state.data.products = [];
         return ctx.reply(`Perfect! Category: ${text} ✅\n\nNow add your products and price\n\nFormat:\nRice - 5000\nShoes - 12000\n\nType DONE when finished`);
       }
-
       if (state.step === 'products') {
         if (text.toLowerCase() === 'done') {
-          // Save to Supabase
           const finalData = {
             shop_name: state.data.shop_name,
             whatsapp: state.data.whatsapp,
             category: state.data.category,
-            product_count: state.data.products.length || 1,
+            product_count: state.data.products.length,
             raw_products: state.data.products
           };
           await createVendor(id, finalData);
-
           const cleanName = state.data.shop_name.replace(/\s+/g, '');
           const uniqueLink = `https://t.me/${ctx.botInfo.username}?start=${cleanName}`;
-
           delete onboarding[id];
           return ctx.reply(`🎉 Your store is ready!\n\nShop: ${finalData.shop_name}\nCategory: ${finalData.category}\nProducts: ${finalData.product_count}\n\nYour unique customer link:\n${uniqueLink}\n\nShare it with customers! They will see your products.\n\nSend /plan to manage.`);
         } else {
@@ -201,7 +206,6 @@ PAID: N2000/month - Unlimited DMs + 20 Products`);
       }
     }
 
-    // NORMAL AUTO-REPLY LOGIC (for existing vendors)
     const check = await checkAndUpdateLimit(id);
     if (!check.allowed) {
       return ctx.reply('⛔ FREE DAILY LIMIT: 10/10 today. Upgrade to PAID N2000 for unlimited.');
@@ -250,54 +254,37 @@ app.get('/admin', async (req, res) => {
 
 app.get('/admin/generate', async (req, res) => {
   if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
-  const token = 'vendor123';
   const botUsername = bot? (await bot.telegram.getMe()).username : 'CityLordsBot';
-  const link = `https://t.me/${botUsername}?start=${token}`;
-  res.send(`<html><body style="font-family:Arial;padding:30px"><h2>✅ Link Generated!</h2><div style="background:#f5f5f5;padding:15px;border:1px dashed #000;word-break:break-all"><b>${link}</b></div><br><p>Send this ONE link to all vendors on TikTok/WhatsApp</p><p>When they click, bot will auto-ask business name -> WhatsApp -> Category -> Products -> Generate unique link</p><br><a href="/admin?admin=${ADMIN_ID}"><button>Back to Admin</button></a> <a href="${link}" target="_blank"><button style="background:green">Test Link</button></a></body></html>`);
+  const link = `https://t.me/${botUsername}?start=vendor123`;
+  res.send(`<html><body style="font-family:Arial;padding:30px"><h2>✅ Link Generated!</h2><div style="background:#f5f5f5;padding:15px;border:1px dashed #000;word-break:break-all"><b>${link}</b></div><br><p>Send this ONE link to all vendors</p><br><a href="/admin?admin=${ADMIN_ID}"><button>Back to Admin</button></a> <a href="${link}" target="_blank"><button style="background:green">Test Link</button></a></body></html>`);
 });
 
-app.get('/admin/disable', async (req, res) => {
-  if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
-  const id = req.query.id;
-  if (supabase) {
-    await supabase.from('vendors').update({ status: 'disabled', link_status: 'Disabled' }).eq('telegram_id', id);
-  } else {
-    if (vendorsMemory[id]) vendorsMemory[id].link_status = 'Disabled';
-  }
-  res.redirect(`/admin?admin=${ADMIN_ID}`);
-});
-
-// NEW ADMIN ACTIONS YOU ASKED FOR
 app.get('/admin/suspend', async (req, res) => {
   if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
   const id = req.query.id;
-  if (supabase) {
-    await supabase.from('vendors').update({ status: 'suspended', link_status: 'Suspended' }).eq('telegram_id', id);
-  } else {
-    if (vendorsMemory[id]) { vendorsMemory[id].status = 'suspended'; vendorsMemory[id].link_status = 'Suspended'; }
-  }
+  if (supabase) await supabase.from('vendors').update({ status: 'suspended', link_status: 'Suspended' }).eq('telegram_id', id);
+  else if (vendorsMemory[id]) { vendorsMemory[id].status = 'suspended'; vendorsMemory[id].link_status = 'Suspended'; }
   res.redirect(`/admin?admin=${ADMIN_ID}`);
 });
-
 app.get('/admin/unsuspend', async (req, res) => {
   if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
   const id = req.query.id;
-  if (supabase) {
-    await supabase.from('vendors').update({ status: 'approved', link_status: 'Active' }).eq('telegram_id', id);
-  } else {
-    if (vendorsMemory[id]) { vendorsMemory[id].status = 'approved'; vendorsMemory[id].link_status = 'Active'; }
-  }
+  if (supabase) await supabase.from('vendors').update({ status: 'approved', link_status: 'Active' }).eq('telegram_id', id);
+  else if (vendorsMemory[id]) { vendorsMemory[id].status = 'approved'; vendorsMemory[id].link_status = 'Active'; }
   res.redirect(`/admin?admin=${ADMIN_ID}`);
 });
-
 app.get('/admin/delete', async (req, res) => {
   if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
   const id = req.query.id;
-  if (supabase) {
-    await supabase.from('vendors').delete().eq('telegram_id', id);
-  } else {
-    delete vendorsMemory[id];
-  }
+  if (supabase) await supabase.from('vendors').delete().eq('telegram_id', id);
+  else delete vendorsMemory[id];
+  res.redirect(`/admin?admin=${ADMIN_ID}`);
+});
+app.get('/admin/disable', async (req, res) => {
+  if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
+  const id = req.query.id;
+  if (supabase) await supabase.from('vendors').update({ status: 'disabled', link_status: 'Disabled' }).eq('telegram_id', id);
+  else if (vendorsMemory[id]) vendorsMemory[id].link_status = 'Disabled';
   res.redirect(`/admin?admin=${ADMIN_ID}`);
 });
 
@@ -342,28 +329,24 @@ app.post('/register/:token/submit', async (req, res) => {
     link_status: 'Active',
     delivery_fee: data.delivery_fee,
     account_no: data.account_no,
-    created_at: new Date().toISOString(),
-    raw_products: JSON.stringify(data)
+    created_at: new Date().toISOString()
   };
-  if (supabase) {
-    await supabase.from('vendors').upsert(vendorData);
-  } else {
-    vendorsMemory[token] = vendorData;
-  }
-  res.send(`<html><body style="font-family:Arial;padding:30px;text-align:center"><h1>✅ Registration Complete!</h1><p>Shop: ${data.business_name}</p><p>Category: ${data.category}</p><p>Plan: FREE (10 DMs/day, 1 Product)</p><br><a href="/dashboard/${token}"><button style="padding:12px 20px;background:#000;color:#fff;border:none">Go to Dashboard</button></a></body></html>`);
+  if (supabase) await supabase.from('vendors').upsert(vendorData);
+  else vendorsMemory[token] = vendorData;
+  res.send(`<html><body style="font-family:Arial;padding:30px;text-align:center"><h1>✅ Registration Complete!</h1><p>Shop: ${data.business_name}</p><p>Category: ${data.category}</p><br><a href="/dashboard/${token}"><button style="padding:12px 20px;background:#000;color:#fff;border:none">Go to Dashboard</button></a></body></html>`);
 });
 
 app.get('/dashboard/:id', async (req, res) => {
   const id = req.params.id;
   let vendor = null;
   if (supabase) {
-    const { data } = await supabase.from('vendors').select('*').eq('telegram_id', id).single();
+    const { data } = await supabase.from('vendors').select('*').eq('telegram_id', id).maybeSingle();
     vendor = data;
   } else {
     vendor = vendorsMemory[id];
   }
   if (!vendor) vendor = { telegram_id: id, shop_name: 'Vendor', plan: 'free', category: '-', product_count: 0, daily_visits: 0, link_status: 'Active' };
-  res.send(`<html><body style="font-family:Arial;padding:20px;max-width:800px;margin:auto"><h1>Vendor Dashboard - ${vendor.shop_name || id}</h1><p>Category: ${vendor.category} | Plan: ${vendor.plan} | Products: ${vendor.product_count} | DMs Today: ${vendor.daily_visits}</p><h3>My Products (edit)</h3><p>Products saved with [+ Add Item] logic - Max 20</p><h3>My Chats (all DMs in one place)</h3><div style="border:1px solid #ccc;padding:10px;height:100px;background:#f9f9f9">No chats yet - Bot waiting</div><h3>Auto-Reply On/Off</h3><label><input type="checkbox" checked> Auto-Reply Enabled</label><h3>My Link Status</h3><p>${vendor.link_status || 'Active'}</p><a href="/admin?admin=${ADMIN_ID}">Admin</a></body></html>`);
+  res.send(`<html><body style="font-family:Arial;padding:20px;max-width:800px;margin:auto"><h1>Vendor Dashboard - ${vendor.shop_name || id}</h1><p>Category: ${vendor.category} | Plan: ${vendor.plan} | Products: ${vendor.product_count} | DMs Today: ${vendor.daily_visits}</p><h3>My Products</h3><p>Products saved with [+ Add Item] logic - Max 20</p><h3>My Chats</h3><div style="border:1px solid #ccc;padding:10px;height:100px;background:#f9f9f9">No chats yet - Bot waiting</div><a href="/admin?admin=${ADMIN_ID}">Admin</a></body></html>`);
 });
 
 app.listen(PORT, () => {
@@ -371,7 +354,7 @@ app.listen(PORT, () => {
   if (bot) {
     bot.launch().then(() => console.log('Bot launched ✅')).catch(e => console.error('Bot launch error:', e.message));
   } else {
-    console.log('BOT_TOKEN missing - Server running without Telegram bot (admin pages still work)');
+    console.log('BOT_TOKEN missing');
   }
 });
 
