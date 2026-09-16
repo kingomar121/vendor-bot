@@ -31,7 +31,15 @@ let vendorsMemory = {};
 let onboarding = {}; // NEW: For vendor onboarding flow
 const bot = BOT_TOKEN? new Telegraf(BOT_TOKEN) : null;
 
-async function getVendor(telegram_id) {
+👋 Welcome to CityLords Vendor Assistant!
+
+Your Shop: Not set yet
+Plan: FREE (10 DMs/day, 1 Product)
+
+Commands:
+/plan - Check your plan & upgrade
+/addproduct - Add product with [+ Add Item] logic
+/myproducts - View products
   if (supabase) {
     const { data } = await supabase.from('vendors').select('*').eq('telegram_id', telegram_id).single();
     return data;
