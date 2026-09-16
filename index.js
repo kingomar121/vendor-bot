@@ -28,6 +28,7 @@ if (SUPABASE_URL && SUPABASE_KEY) {
 }
 
 let vendorsMemory = {};
+let onboarding = {}; // NEW: For vendor onboarding flow
 const bot = BOT_TOKEN? new Telegraf(BOT_TOKEN) : null;
 
 async function getVendor(telegram_id) {
@@ -46,7 +47,7 @@ async function createVendor(telegram_id, data = {}) {
     whatsapp: data.whatsapp || null,
     category: data.category || null,
     plan: 'free',
-    product_count: 0,
+    product_count: data.product_count || 0,
     daily_visits: 0,
     last_visit_date: new Date().toDateString(),
     status: 'approved',
@@ -84,8 +85,24 @@ async function checkAndUpdateLimit(telegram_id) {
 }
 
 if (bot) {
+  // ===== FIX 1: NEW bot.start WITH PAYLOAD HANDLING =====
   bot.start(async (ctx) => {
     const id = String(ctx.from.id);
+    const payload = ctx.startPayload; // Gets vendor123 from link
+    console.log('Start payload:', payload, 'from', id);
+
+    // Vendor clicked invite link https://t.me/CityLordsBot?start=vendor123
+    if (payload === 'vendor123') {
+      onboarding[id] = { step: 'business_name', data: {} };
+      return ctx.reply(`👋 Welcome to CityLords! 🎉\n\nLet's create your store quickly.\n\nWhat is your business name?`);
+    }
+
+    // Customer clicked vendor unique link e.g?start=ShopName
+    if (payload && payload!== 'vendor123') {
+      return ctx.reply(`Welcome to ${payload} store! 🛒\nProducts loading soon...\n\nType /start to create your own store.`);
+    }
+
+    // Normal start
     let vendor = await getVendor(id);
     if (!vendor) vendor = await createVendor(id);
     ctx.reply(`👋 Welcome to CityLords Vendor Assistant!
@@ -123,13 +140,65 @@ PAID: N2000/month - Unlimited DMs + 20 Products`);
     ctx.reply(`➕ Send product like: Name - Price\nExample: Nike Air Max - 25000`);
   });
 
+  // ===== FIX 2 & 3: NEW bot.on text WITH FULL FLOW =====
   bot.on('text', async (ctx) => {
-    if (ctx.message.text.startsWith('/')) return;
-    const check = await checkAndUpdateLimit(String(ctx.from.id));
+    const id = String(ctx.from.id);
+    const text = ctx.message.text;
+    if (text.startsWith('/')) return;
+
+    // ONBOARDING FLOW FOR NEW VENDORS
+    if (onboarding[id]) {
+      const state = onboarding[id];
+
+      if (state.step === 'business_name') {
+        state.data.shop_name = text;
+        state.step = 'whatsapp';
+        return ctx.reply(`Great! "${text}" ✅\n\nWhat is your WhatsApp number?`);
+      }
+
+      if (state.step === 'whatsapp') {
+        state.data.whatsapp = text;
+        state.step = 'category';
+        return ctx.reply(`Thanks!\n\nWhat is your category?\nOptions: Fashion / Electronics / Used Items / Phones / Shoes / Others`);
+      }
+
+      if (state.step === 'category') {
+        state.data.category = text;
+        state.step = 'products';
+        state.data.products = [];
+        return ctx.reply(`Perfect! Category: ${text} ✅\n\nNow add your products and price\n\nFormat:\nRice - 5000\nShoes - 12000\n\nType DONE when finished`);
+      }
+
+      if (state.step === 'products') {
+        if (text.toLowerCase() === 'done') {
+          // Save to Supabase
+          const finalData = {
+            shop_name: state.data.shop_name,
+            whatsapp: state.data.whatsapp,
+            category: state.data.category,
+            product_count: state.data.products.length || 1,
+            raw_products: state.data.products
+          };
+          await createVendor(id, finalData);
+
+          const cleanName = state.data.shop_name.replace(/\s+/g, '');
+          const uniqueLink = `https://t.me/${ctx.botInfo.username}?start=${cleanName}`;
+
+          delete onboarding[id];
+          return ctx.reply(`🎉 Your store is ready!\n\nShop: ${finalData.shop_name}\nCategory: ${finalData.category}\nProducts: ${finalData.product_count}\n\nYour unique customer link:\n${uniqueLink}\n\nShare it with customers! They will see your products.\n\nSend /plan to manage.`);
+        } else {
+          state.data.products.push(text);
+          return ctx.reply(`Added ✅ (${state.data.products.length} products) - Add more or type DONE`);
+        }
+      }
+    }
+
+    // NORMAL AUTO-REPLY LOGIC (for existing vendors)
+    const check = await checkAndUpdateLimit(id);
     if (!check.allowed) {
       return ctx.reply('⛔ FREE DAILY LIMIT: 10/10 today. Upgrade to PAID N2000 for unlimited.');
     }
-    ctx.reply(`✅ Auto-Reply (${check.vendor.daily_visits}/10 today)\nYou said: ${ctx.message.text}`);
+    ctx.reply(`✅ Auto-Reply (${check.vendor.daily_visits}/10 today)\nYou said: ${text}`);
   });
 }
 
@@ -148,12 +217,24 @@ app.get('/admin', async (req, res) => {
   } else {
     vendors = Object.values(vendorsMemory);
   }
-  let html = `<html><head><style>body{font-family:Arial;padding:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}button{padding:10px 15px;background:#000;color:#fff;border:none;cursor:pointer}</style></head><body>
-  <h1>CityLords Admin</h1>
+  let html = `<html><head><style>body{font-family:Arial;padding:20px}table{border-collapse:collapse;width:100%}th,td{border:1px solid #ccc;padding:8px}button{padding:10px 15px;background:#000;color:#fff;border:none;cursor:pointer;margin:2px}.suspend{background:orange}.delete{background:red}.unsuspend{background:green}</style></head><body>
+  <h1>CityLords Admin - Vendor Assistant powered by CityLords</h1>
   <a href="/admin/generate?admin=${ADMIN_ID}"><button>+ Generate Vendor Link</button></a><br><br>
-  <table><tr><th>Vendor Name</th><th>Category</th><th>Link Status</th><th>Date Joined</th><th>Plan</th><th>Action</th></tr>`;
+  <table><tr><th>Vendor Name</th><th>Category</th><th>WhatsApp</th><th>Status</th><th>Plan</th><th>Action</th></tr>`;
   vendors.forEach(v => {
-    html += `<tr><td>${v.shop_name || v.telegram_id}<br><small>${v.whatsapp || ''}</small></td><td>${v.category || '-'}</td><td>${v.link_status || 'Active'}</td><td>${v.created_at? new Date(v.created_at).toLocaleDateString() : '-'}</td><td>${v.plan}</td><td><a href="/dashboard/${v.telegram_id}">View</a> | <a href="/admin/disable?id=${v.telegram_id}&admin=${ADMIN_ID}">Disable</a></td></tr>`;
+    html += `<tr>
+      <td>${v.shop_name || v.telegram_id}</td>
+      <td>${v.category || '-'}</td>
+      <td>${v.whatsapp || ''}</td>
+      <td>${v.status || 'approved'} / ${v.link_status || 'Active'}</td>
+      <td>${v.plan}</td>
+      <td>
+        <a href="/dashboard/${v.telegram_id}"><button>View</button></a>
+        <a href="/admin/suspend?id=${v.telegram_id}&admin=${ADMIN_ID}"><button class="suspend">Suspend</button></a>
+        <a href="/admin/unsuspend?id=${v.telegram_id}&admin=${ADMIN_ID}"><button class="unsuspend">Unsuspend</button></a>
+        <a href="/admin/delete?id=${v.telegram_id}&admin=${ADMIN_ID}"><button class="delete">Delete</button></a>
+      </td>
+    </tr>`;
   });
   html += `</table><br><p>Total Vendors: ${vendors.length}</p></body></html>`;
   res.send(html);
@@ -161,12 +242,10 @@ app.get('/admin', async (req, res) => {
 
 app.get('/admin/generate', async (req, res) => {
   if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
-  const token = 'vendor-' + Math.random().toString(36).substring(7) + Date.now().toString(36);
-  const link = `${req.protocol}://${req.get('host')}/register/${token}`;
-  if (supabase) {
-    await supabase.from('vendor_links').insert({ token, link, status: 'active', created_at: new Date().toISOString() });
-  }
-  res.send(`<html><body style="font-family:Arial;padding:30px"><h2>✅ Link Generated!</h2><div style="background:#f5f5f5;padding:15px;border:1px dashed #000;word-break:break-all"><b>${link}</b></div><br><p>Send this to vendor on TikTok/WhatsApp</p><br><a href="/admin?admin=${ADMIN_ID}"><button>Back to Admin</button></a> <a href="${link}" target="_blank"><button style="background:green">Test Link</button></a></body></html>`);
+  const token = 'vendor123';
+  const botUsername = bot? (await bot.telegram.getMe()).username : 'CityLordsBot';
+  const link = `https://t.me/${botUsername}?start=${token}`;
+  res.send(`<html><body style="font-family:Arial;padding:30px"><h2>✅ Link Generated!</h2><div style="background:#f5f5f5;padding:15px;border:1px dashed #000;word-break:break-all"><b>${link}</b></div><br><p>Send this ONE link to all vendors on TikTok/WhatsApp</p><p>When they click, bot will auto-ask business name -> WhatsApp -> Category -> Products -> Generate unique link</p><br><a href="/admin?admin=${ADMIN_ID}"><button>Back to Admin</button></a> <a href="${link}" target="_blank"><button style="background:green">Test Link</button></a></body></html>`);
 });
 
 app.get('/admin/disable', async (req, res) => {
@@ -176,6 +255,40 @@ app.get('/admin/disable', async (req, res) => {
     await supabase.from('vendors').update({ status: 'disabled', link_status: 'Disabled' }).eq('telegram_id', id);
   } else {
     if (vendorsMemory[id]) vendorsMemory[id].link_status = 'Disabled';
+  }
+  res.redirect(`/admin?admin=${ADMIN_ID}`);
+});
+
+// NEW ADMIN ACTIONS YOU ASKED FOR
+app.get('/admin/suspend', async (req, res) => {
+  if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
+  const id = req.query.id;
+  if (supabase) {
+    await supabase.from('vendors').update({ status: 'suspended', link_status: 'Suspended' }).eq('telegram_id', id);
+  } else {
+    if (vendorsMemory[id]) { vendorsMemory[id].status = 'suspended'; vendorsMemory[id].link_status = 'Suspended'; }
+  }
+  res.redirect(`/admin?admin=${ADMIN_ID}`);
+});
+
+app.get('/admin/unsuspend', async (req, res) => {
+  if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
+  const id = req.query.id;
+  if (supabase) {
+    await supabase.from('vendors').update({ status: 'approved', link_status: 'Active' }).eq('telegram_id', id);
+  } else {
+    if (vendorsMemory[id]) { vendorsMemory[id].status = 'approved'; vendorsMemory[id].link_status = 'Active'; }
+  }
+  res.redirect(`/admin?admin=${ADMIN_ID}`);
+});
+
+app.get('/admin/delete', async (req, res) => {
+  if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
+  const id = req.query.id;
+  if (supabase) {
+    await supabase.from('vendors').delete().eq('telegram_id', id);
+  } else {
+    delete vendorsMemory[id];
   }
   res.redirect(`/admin?admin=${ADMIN_ID}`);
 });
