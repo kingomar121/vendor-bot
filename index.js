@@ -15,8 +15,8 @@ const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL || '';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- CATEGORIES ---
-const CATEGORIES = ['Food', 'Fashion', 'Electronics', 'Beauty', 'Groceries', 'Services'];
+// --- YOUR 7 CATEGORIES ---
+const CATEGORIES = ['Electronics', 'Fashion', 'Used items', 'Food and drinks', 'Real Estates', 'Services', 'Others'];
 
 function normalizeWa(raw) {
   let d = String(raw).replace(/[^0-9]/g, '');
@@ -68,7 +68,6 @@ async function createVendor(id, extra) {
   return vendor;
 }
 
-// FIX 1: Clean start - no double
 bot.start(async (ctx) => {
   const id = String(ctx.from.id);
   console.log('START', id, ctx.startPayload);
@@ -84,7 +83,7 @@ bot.command('vendor123', async (ctx) => {
 bot.on('text', async (ctx) => {
   const id = String(ctx.from.id);
   const text = ctx.message.text.trim();
-  if (text.startsWith('/')) return; // FIX 1: ignore all commands here
+  if (text.startsWith('/')) return;
 
   let sess = await getSession(id);
   if (!sess) {
@@ -98,14 +97,12 @@ bot.on('text', async (ctx) => {
   if (step === 'business_name') {
     data.shop_name = text;
     await setSession(id, 'whatsapp', data);
-    // FIX 2: No pre-set number
-    return ctx.reply(`Great! "${data.shop_name}" ✅\n\nWhat is your WhatsApp number?\nExample: 08012345678`);
+    return ctx.reply(`Great! "${data.shop_name}" ✅\n\nWhat is your WhatsApp number?\nExample: 080xxxxx`);
   }
 
   if (step === 'whatsapp') {
     data.whatsapp = normalizeWa(text);
     await setSession(id, 'category', data);
-    // FIX 3: Show 6 categories as buttons
     return ctx.reply(
       `Number ${prettyWa(data.whatsapp)} ✅\n\nChoose your category:`,
       Markup.keyboard(CATEGORIES.map(c => [c])).oneTime().resize()
@@ -114,14 +111,13 @@ bot.on('text', async (ctx) => {
 
   if (step === 'category') {
     if (!CATEGORIES.includes(text)) {
-      return ctx.reply('Please choose from the 6 buttons below:', Markup.keyboard(CATEGORIES.map(c => [c])).oneTime().resize());
+      return ctx.reply('Please choose from the list below:', Markup.keyboard(CATEGORIES.map(c => [c])).oneTime().resize());
     }
     data.category = text;
     data.products = [];
     await setSession(id, 'products', data);
-    // FIX 4: Correct wording
     return ctx.reply(
-      `Category: ${text} ✅\n\nNow add your products with prices.\nFormat: Product Name - Price\nExample: Rice - 5000\n\nSend one product per message. Type DONE when finished.`,
+      `Category: ${text} ✅\n\nNow add your products with prices.\nFormat: Product Name - Price\nExample: Rice - 5000\n\nSend one per message. Type DONE when finished.`,
       Markup.removeKeyboard()
     );
   }
@@ -133,12 +129,12 @@ bot.on('text', async (ctx) => {
       await createVendor(id, { shop_name: data.shop_name, whatsapp: data.whatsapp, category: data.category, product_count: count, raw_products: data.products });
       await delSession(id);
       const link = `https://api.whatsapp.com/send?phone=${data.whatsapp}&text=Hi%20${encodeURIComponent(data.shop_name)}%20I%20saw%20your%20store%20on%20CityLords`;
-      return ctx.reply(`🎉 Ready!\n\nShop: ${data.shop_name}\nCategory: ${data.category}\nProducts: ${count}\nLink: ${link}\n\nYour store link ALWAYS opens WhatsApp direct!`);
+      return ctx.reply(`🎉 Ready!\n\nShop: ${data.shop_name}\nCategory: ${data.category}\nProducts: ${count}\nLink: ${link}\n\nThis link ALWAYS opens WhatsApp direct!`);
     } else {
       data.products = data.products || [];
       data.products.push(text);
       await setSession(id, 'products', data);
-      return ctx.reply(`✅ Added: ${text} (${data.products.length})\nSend another product or type DONE`);
+      return ctx.reply(`✅ Added: ${text} (${data.products.length})\nSend another or type DONE`);
     }
   }
 });
