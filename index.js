@@ -12,10 +12,16 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 10000;
 const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL || '';
 
+// --- WhatsApp ENV ---
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN; // EAA...
+const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
+const CITYLORDS_WA = process.env.CITYLORDS_WA; // e.g 15551234567 test number without +
+const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'citylords123';
+
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 const bot = new Telegraf(BOT_TOKEN);
 
-// --- YOUR 7 CATEGORIES ---
+// --- CATEGORIES ---
 const CATEGORIES = ['Electronics', 'Fashion', 'Used items', 'Food and drinks', 'Real Estates', 'Services', 'Others'];
 
 function normalizeWa(raw) {
@@ -68,9 +74,29 @@ async function createVendor(id, extra) {
   return vendor;
 }
 
+// --- WhatsApp Send Function ---
+async function sendWhatsApp(to, message) {
+  if (!WHATSAPP_TOKEN ||!PHONE_NUMBER_ID) {
+    console.log('WhatsApp not configured');
+    return;
+  }
+  try {
+    const url = `https://graph.facebook.com/v20.0/${PHONE_NUMBER_ID}/messages`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${WHATSAPP_TOKEN}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messaging_product: 'whatsapp', to: to, type: 'text', text: { body: message } })
+    });
+    const data = await res.json();
+    console.log('WA sent:', data);
+  } catch (e) {
+    console.log('WA error:', e.message);
+  }
+}
+
+// --- Telegram Bot ---
 bot.start(async (ctx) => {
   const id = String(ctx.from.id);
-  console.log('START', id, ctx.startPayload);
   await setSession(id, 'business_name', { products: [] });
   return ctx.reply('Welcome to CityLords! 🏙️\n\nWhat is your business name?');
 });
@@ -84,31 +110,23 @@ bot.on('text', async (ctx) => {
   const id = String(ctx.from.id);
   const text = ctx.message.text.trim();
   if (text.startsWith('/')) return;
-
   let sess = await getSession(id);
   if (!sess) {
     await setSession(id, 'business_name', { products: [] });
     return ctx.reply('Welcome to CityLords! What is your business name?');
   }
-
   let data = sess.data || {};
   let step = sess.step;
-
   if (step === 'business_name') {
     data.shop_name = text;
     await setSession(id, 'whatsapp', data);
     return ctx.reply(`Great! "${data.shop_name}" ✅\n\nWhat is your WhatsApp number?\nExample: 080xxxxx`);
   }
-
   if (step === 'whatsapp') {
     data.whatsapp = normalizeWa(text);
     await setSession(id, 'category', data);
-    return ctx.reply(
-      `Number ${prettyWa(data.whatsapp)} ✅\n\nChoose your category:`,
-      Markup.keyboard(CATEGORIES.map(c => [c])).oneTime().resize()
-    );
+    return ctx.reply(`Number ${prettyWa(data.whatsapp)} ✅\n\nChoose your category:`, Markup.keyboard(CATEGORIES.map(c => [c])).oneTime().resize());
   }
-
   if (step === 'category') {
     if (!CATEGORIES.includes(text)) {
       return ctx.reply('Please choose from the list below:', Markup.keyboard(CATEGORIES.map(c => [c])).oneTime().resize());
@@ -116,20 +134,16 @@ bot.on('text', async (ctx) => {
     data.category = text;
     data.products = [];
     await setSession(id, 'products', data);
-    return ctx.reply(
-      `Category: ${text} ✅\n\nNow add your products with prices.\nFormat: Product Name - Price\nExample: Rice - 5000\n\nSend one per message. Type DONE when finished.`,
-      Markup.removeKeyboard()
-    );
+    return ctx.reply(`Category: ${text} ✅\n\nNow add your products with prices.\nFormat: Product Name - Price\nExample: Rice - 5000\n\nSend one per message. Type DONE when finished.`, Markup.removeKeyboard());
   }
-
   if (step === 'products') {
     if (text.toLowerCase() === 'done') {
       const count = (data.products || []).length;
       if (count === 0) return ctx.reply('Please add at least 1 product first.\nExample: Rice - 5000');
-      await createVendor(id, { shop_name: data.shop_name, whatsapp: data.whatsapp, category: data.category, product_count: count, raw_products: data.products });
+      const vendor = await createVendor(id, { shop_name: data.shop_name, whatsapp: data.whatsapp, category: data.category, product_count: count, raw_products: data.products });
       await delSession(id);
-      const link = `https://api.whatsapp.com/send?phone=${data.whatsapp}&text=Hi%20${encodeURIComponent(data.shop_name)}%20I%20saw%20your%20store%20on%20CityLords`;
-      return ctx.reply(`🎉 Ready!\n\nShop: ${data.shop_name}\nCategory: ${data.category}\nProducts: ${count}\nLink: ${link}\n\nThis link ALWAYS opens WhatsApp direct!`);
+      const storeLink = `${WEBHOOK_URL}/store/${id}`;
+      return ctx.reply(`🎉 Ready!\n\nShop: ${data.shop_name}\nCategory: ${data.category}\nProducts: ${count}\n\nYour store link (uses CityLords WhatsApp bot):\n${storeLink}\n\nShare this link to customers!`);
     } else {
       data.products = data.products || [];
       data.products.push(text);
@@ -139,20 +153,75 @@ bot.on('text', async (ctx) => {
   }
 });
 
+// --- Express Routes ---
 app.get('/', (req, res) => res.send('CityLords LIVE'));
+
 app.post('/webhook', (req, res) => bot.handleUpdate(req.body, res));
+
+// WhatsApp Webhook Verification (Meta will call this)
+app.get('/whatsapp-webhook', (req, res) => {
+  const mode = req.query['hub.mode'];
+  const token = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    console.log('Webhook verified');
+    return res.status(200).send(challenge);
+  }
+  return res.sendStatus(403);
+});
+
+// WhatsApp Incoming Messages
+app.post('/whatsapp-webhook', async (req, res) => {
+  try {
+    const entry = req.body.entry?.[0];
+    const change = entry?.changes?.[0];
+    const message = change?.value?.messages?.[0];
+    if (message) {
+      const from = message.from; // customer number
+      const text = message.text?.body || '';
+      console.log(`WA from ${from}: ${text}`);
+
+      // Try to find which store customer is chatting about
+      // Text will be like "STORE_8030671133 Hi I found you..."
+      let vendorId = null;
+      const match = text.match(/STORE_(\d+)/);
+      if (match) vendorId = match[1];
+
+      if (vendorId) {
+        const v = await getVendor(vendorId);
+        if (v) {
+          const prods = await supabase.from('products').select('*').eq('vendor_id', vendorId);
+          let prodList = (prods.data||[]).map(p=>`• ${p.name} - ${p.price}`).join('\n');
+          await sendWhatsApp(from, `Welcome to ${v.shop_name} on CityLords! 🏙️\nCategory: ${v.category}\n\nProducts:\n${prodList}\n\nReply with product name to order.`);
+        }
+      } else {
+        await sendWhatsApp(from, `Welcome to CityLords! 🏙️\nTell us shop name or product you want?`);
+      }
+    }
+    res.sendStatus(200);
+  } catch (e) {
+    console.log('WA webhook error', e.message);
+    res.sendStatus(200);
+  }
+});
+
+// Store link now redirects to CityLords WhatsApp (test number), NOT vendor personal
 app.get('/store/:id', async (req, res) => {
   const v = await getVendor(req.params.id);
   if (!v) return res.send('Shop not found');
-  const link = `https://api.whatsapp.com/send?phone=${v.whatsapp}&text=Hi%20${encodeURIComponent(v.shop_name)}%20I%20found%20you%20on%20CityLords`;
+  if (!CITYLORDS_WA) return res.send('WhatsApp not configured yet');
+  // We encode vendor ID so webhook knows which shop
+  const msg = `STORE_${v.telegram_id} Hi ${v.shop_name} I found you on CityLords`;
+  const link = `https://wa.me/${CITYLORDS_WA}?text=${encodeURIComponent(msg)}`;
   return res.redirect(link);
 });
+
 app.get('/admin', async (req, res) => {
   if (String(req.query.admin)!== String(ADMIN_ID)) return res.send('Admin only');
   const r = await supabase.from('vendors').select('*');
-  let html = `<h1>${(r.data||[]).length} Vendors</h1><table border=1><tr><th>Shop</th><th>WhatsApp</th><th>Category</th><th>Count</th><th>Link</th></tr>`;
+  let html = `<h1>${(r.data||[]).length} Vendors</h1><table border=1><tr><th>Shop</th><th>WhatsApp</th><th>Category</th><th>Count</th><th>Store Link</th></tr>`;
   (r.data||[]).forEach(v => {
-    html += `<tr><td>${v.shop_name}</td><td>${v.whatsapp_display}</td><td>${v.category}</td><td>${v.product_count}</td><td><a href="https://api.whatsapp.com/send?phone=${v.whatsapp}" target="_blank">Open WhatsApp</a></td></tr>`;
+    html += `<tr><td>${v.shop_name}</td><td>${v.whatsapp_display}</td><td>${v.category}</td><td>${v.product_count}</td><td><a href="/store/${v.telegram_id}" target="_blank">Open Store (via CityLords WA)</a></td></tr>`;
   });
   html += '</table>';
   res.send(html);
