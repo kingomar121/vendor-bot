@@ -18,14 +18,20 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const PORT = process.env.PORT || 10000;
 const WEBHOOK_URL = process.env.RENDER_EXTERNAL_URL || '';
 
-/* WhatsApp - kept ready, but not required for this test */
+/* WhatsApp - not required for current Telegram testing */
 const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
 const PHONE_NUMBER_ID = process.env.PHONE_NUMBER_ID;
 const CITYLORDS_WA = process.env.CITYLORDS_WA;
-const VERIFY_TOKEN = process.env.VERIFY_TOKEN || 'citylords123';
+const VERIFY_TOKEN =
+  process.env.VERIFY_TOKEN || 'citylords123';
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_KEY
+);
+
 const bot = new Telegraf(BOT_TOKEN);
+
 
 /* =========================================================
    CONSTANTS
@@ -41,39 +47,78 @@ const CATEGORIES = [
   'Others'
 ];
 
-/*
-  Telegram duplicate protection.
-
-  This protects the current single Render instance from
-  processing the same Telegram update more than once.
-
-  It is intentionally limited in size so it doesn't grow forever.
-*/
-const processedTelegramUpdates = new Set();
-const MAX_PROCESSED_UPDATES = 5000;
-
 
 /* =========================================================
-   BASIC HELPERS
+   TELEGRAM DUPLICATE PROTECTION
 ========================================================= */
 
-function rememberTelegramUpdate(updateId) {
-  if (!updateId) return true;
+const processedUpdates = new Set();
+const MAX_PROCESSED_UPDATES = 5000;
 
-  const key = String(updateId);
-
-  if (processedTelegramUpdates.has(key)) {
+function isDuplicateUpdate(updateId) {
+  if (updateId === undefined || updateId === null) {
     return false;
   }
 
-  processedTelegramUpdates.add(key);
+  const key = String(updateId);
 
-  if (processedTelegramUpdates.size > MAX_PROCESSED_UPDATES) {
-    const first = processedTelegramUpdates.values().next().value;
-    processedTelegramUpdates.delete(first);
+  if (processedUpdates.has(key)) {
+    return true;
   }
 
-  return true;
+  processedUpdates.add(key);
+
+  if (processedUpdates.size > MAX_PROCESSED_UPDATES) {
+    const first =
+      processedUpdates.values().next().value;
+
+    processedUpdates.delete(first);
+  }
+
+  return false;
+}
+
+
+/* =========================================================
+   TELEGRAM LOGGING
+========================================================= */
+
+function logUpdate(update) {
+  try {
+    const message =
+      update?.message ||
+      update?.edited_message ||
+      null;
+
+    if (!message) {
+      console.log(
+        '[TELEGRAM] Non-message update:',
+        update?.update_id
+      );
+      return;
+    }
+
+    console.log(
+      '[TELEGRAM] UPDATE RECEIVED:',
+      update.update_id
+    );
+
+    console.log(
+      '[TELEGRAM] USER:',
+      message.from?.id
+    );
+
+    console.log(
+      '[TELEGRAM] TEXT:',
+      message.text || '(no text)'
+    );
+
+  } catch (e) {
+    console.log(
+      '[TELEGRAM] Logging error:',
+      e.message
+    );
+  }
 }
 
 
@@ -82,7 +127,8 @@ function rememberTelegramUpdate(updateId) {
 ========================================================= */
 
 function normalizeWa(raw) {
-  let d = String(raw || '').replace(/[^0-9]/g, '');
+  let d = String(raw || '')
+    .replace(/[^0-9]/g, '');
 
   if (d.startsWith('0')) {
     d = '234' + d.slice(1);
@@ -100,10 +146,14 @@ function prettyWa(d) {
   if (!d) return '';
 
   if (d.startsWith('234')) {
-    return '+234 ' +
-      d.slice(3, 6) + ' ' +
-      d.slice(6, 9) + ' ' +
-      d.slice(9);
+    return (
+      '+234 ' +
+      d.slice(3, 6) +
+      ' ' +
+      d.slice(6, 9) +
+      ' ' +
+      d.slice(9)
+    );
   }
 
   return '+' + d;
@@ -116,8 +166,8 @@ function prettyWa(d) {
 
 function normalizeBusinessName(name) {
   return String(name || '')
-    .trim()
     .toLowerCase()
+    .trim()
     .replace(/\s+/g, ' ')
     .replace(/[.,!?]+$/g, '')
     .trim();
@@ -125,186 +175,299 @@ function normalizeBusinessName(name) {
 
 
 /* =========================================================
-   SUPABASE - ONBOARDING SESSION
+   ONBOARDING SESSION FUNCTIONS
 ========================================================= */
 
-async function getSession(id) {
+async function getSession(telegramId) {
   try {
-    const r = await supabase
+    const result = await supabase
       .from('onboarding_sessions')
       .select('*')
-      .eq('telegram_id', String(id))
+      .eq('telegram_id', String(telegramId))
       .maybeSingle();
 
-    if (r.error) {
-      console.log('getSession error:', r.error.message);
+    if (result.error) {
+      console.log(
+        '[SESSION] get error:',
+        result.error.message
+      );
+
       return null;
     }
 
-    return r.data;
+    return result.data;
+
   } catch (e) {
-    console.log('getSession exception:', e.message);
+    console.log(
+      '[SESSION] get exception:',
+      e.message
+    );
+
     return null;
   }
 }
 
 
-async function setSession(id, step, dataObj) {
+async function setSession(
+  telegramId,
+  step,
+  data
+) {
   try {
-    const r = await supabase
+    const result = await supabase
       .from('onboarding_sessions')
       .upsert(
         {
-          telegram_id: String(id),
-          step,
-          data: dataObj
+          telegram_id: String(telegramId),
+          step: step,
+          data: data,
+          updated_at: new Date().toISOString()
         },
         {
           onConflict: 'telegram_id'
         }
       );
 
-    if (r.error) {
-      console.log('setSession error:', r.error.message);
+    if (result.error) {
+      console.log(
+        '[SESSION] set error:',
+        result.error.message
+      );
     }
 
-    return r;
+    return result;
+
   } catch (e) {
-    console.log('setSession exception:', e.message);
+    console.log(
+      '[SESSION] set exception:',
+      e.message
+    );
+
     return null;
   }
 }
 
 
-async function delSession(id) {
+async function deleteSession(telegramId) {
   try {
-    const r = await supabase
+    const result = await supabase
       .from('onboarding_sessions')
       .delete()
-      .eq('telegram_id', String(id));
+      .eq('telegram_id', String(telegramId));
 
-    if (r.error) {
-      console.log('delSession error:', r.error.message);
+    if (result.error) {
+      console.log(
+        '[SESSION] delete error:',
+        result.error.message
+      );
     }
 
-    return r;
+    return result;
+
   } catch (e) {
-    console.log('delSession exception:', e.message);
+    console.log(
+      '[SESSION] delete exception:',
+      e.message
+    );
+
     return null;
   }
 }
 
 
 /* =========================================================
-   SUPABASE - VENDOR
+   VENDOR FUNCTIONS
 ========================================================= */
 
-async function getVendor(id) {
+async function getVendor(telegramId) {
   try {
-    const r = await supabase
+    const result = await supabase
       .from('vendors')
       .select('*')
-      .eq('telegram_id', String(id))
+      .eq('telegram_id', String(telegramId))
       .maybeSingle();
 
-    if (r.error) {
-      console.log('getVendor error:', r.error.message);
+    if (result.error) {
+      console.log(
+        '[VENDOR] get error:',
+        result.error.message
+      );
+
       return null;
     }
 
-    return r.data;
+    return result.data;
+
   } catch (e) {
-    console.log('getVendor exception:', e.message);
+    console.log(
+      '[VENDOR] get exception:',
+      e.message
+    );
+
     return null;
   }
 }
 
 
 /*
-  Finds an existing business by normalized name.
+   Existing business-name detection.
 
-  For the current test version we fetch the vendor names and
-  compare them in JavaScript. This is fine for testing and
-  small numbers of vendors.
+   First try Supabase case-insensitive exact match.
 
-  Later, when CityLords grows, we should add a normalized-name
-  database column/index for faster searching.
+   Then perform a normalized comparison in JavaScript
+   so differences such as:
+
+   Husna Stores
+   husna stores
+   HUSNA STORES
+   Husna   Stores
+
+   are treated as the same business name.
 */
 async function getVendorByBusinessName(name) {
-  const target = normalizeBusinessName(name);
+  const target =
+    normalizeBusinessName(name);
 
-  if (!target) return null;
+  if (!target) {
+    return null;
+  }
 
   try {
-    const r = await supabase
-      .from('vendors')
-      .select('*');
 
-    if (r.error) {
-      console.log(
-        'getVendorByBusinessName error:',
-        r.error.message
+    /* ---------------------------------------------
+       FIRST CHECK: database case-insensitive match
+    --------------------------------------------- */
+
+    const directResult = await supabase
+      .from('vendors')
+      .select('*')
+      .ilike('shop_name', name.trim())
+      .limit(1);
+
+    if (
+      !directResult.error &&
+      directResult.data &&
+      directResult.data.length > 0
+    ) {
+      return directResult.data[0];
+    }
+
+
+    /* ---------------------------------------------
+       SECOND CHECK: normalized comparison
+    --------------------------------------------- */
+
+    const allResult = await supabase
+      .from('vendors')
+      .select(
+        'telegram_id,shop_name,whatsapp,whatsapp_display,category,product_count,status,created_at'
       );
+
+    if (allResult.error) {
+      console.log(
+        '[BUSINESS NAME] search error:',
+        allResult.error.message
+      );
+
       return null;
     }
 
-    const vendors = r.data || [];
+    const vendors =
+      allResult.data || [];
 
     for (const vendor of vendors) {
-      if (
-        normalizeBusinessName(vendor.shop_name) === target
-      ) {
+
+      const existingName =
+        normalizeBusinessName(
+          vendor.shop_name
+        );
+
+      if (existingName === target) {
         return vendor;
       }
     }
 
     return null;
+
   } catch (e) {
+
     console.log(
-      'getVendorByBusinessName exception:',
+      '[BUSINESS NAME] exception:',
       e.message
     );
+
     return null;
   }
 }
 
 
 /* =========================================================
-   CREATE / UPDATE VENDOR
+   CREATE VENDOR
 ========================================================= */
 
-async function createVendor(id, extra) {
-  const existing = await getVendor(id);
+async function createVendor(
+  telegramId,
+  details
+) {
+  const existing =
+    await getVendor(telegramId);
 
-  const count =
-    extra.product_count !== undefined
-      ? extra.product_count
-      : (existing ? existing.product_count : 0);
+  const productCount =
+    details.product_count !== undefined
+      ? details.product_count
+      : (
+          existing
+            ? existing.product_count
+            : 0
+        );
 
   const vendor = {
-    telegram_id: String(id),
+    telegram_id:
+      String(telegramId),
 
     shop_name:
-      extra.shop_name ||
-      (existing ? existing.shop_name : null),
+      details.shop_name ||
+      (
+        existing
+          ? existing.shop_name
+          : null
+      ),
 
     whatsapp:
-      extra.whatsapp
-        ? normalizeWa(extra.whatsapp)
-        : (existing ? existing.whatsapp : null),
+      details.whatsapp
+        ? normalizeWa(details.whatsapp)
+        : (
+            existing
+              ? existing.whatsapp
+              : null
+          ),
 
     whatsapp_display:
-      extra.whatsapp
-        ? prettyWa(normalizeWa(extra.whatsapp))
-        : (existing ? existing.whatsapp_display : null),
+      details.whatsapp
+        ? prettyWa(
+            normalizeWa(
+              details.whatsapp
+            )
+          )
+        : (
+            existing
+              ? existing.whatsapp_display
+              : null
+          ),
 
     category:
-      extra.category ||
-      (existing ? existing.category : null),
+      details.category ||
+      (
+        existing
+          ? existing.category
+          : null
+      ),
 
-    product_count: count,
+    product_count:
+      productCount,
 
-    status: 'approved',
+    status:
+      'approved',
 
     created_at:
       existing
@@ -312,37 +475,64 @@ async function createVendor(id, extra) {
         : new Date().toISOString()
   };
 
-  const result = await supabase
-    .from('vendors')
-    .upsert(
-      vendor,
-      {
-        onConflict: 'telegram_id'
-      }
-    );
+
+  const result =
+    await supabase
+      .from('vendors')
+      .upsert(
+        vendor,
+        {
+          onConflict:
+            'telegram_id'
+        }
+      );
 
   if (result.error) {
+
     console.log(
-      'createVendor error:',
+      '[VENDOR] create error:',
       result.error.message
     );
-    throw new Error(result.error.message);
+
+    throw new Error(
+      result.error.message
+    );
   }
 
-  /*
-    Save products only when raw_products were supplied.
-  */
-  if (
-    extra.raw_products &&
-    extra.raw_products.length
-  ) {
-    await supabase
-      .from('products')
-      .delete()
-      .eq('vendor_id', String(id));
 
-    for (const p of extra.raw_products) {
-      const parts = String(p).split('-');
+  /* ---------------------------------------------
+     Save products
+  --------------------------------------------- */
+
+  if (
+    details.raw_products &&
+    details.raw_products.length > 0
+  ) {
+
+    const deleteResult =
+      await supabase
+        .from('products')
+        .delete()
+        .eq(
+          'vendor_id',
+          String(telegramId)
+        );
+
+    if (deleteResult.error) {
+      console.log(
+        '[PRODUCTS] delete error:',
+        deleteResult.error.message
+      );
+    }
+
+
+    for (
+      const product
+      of details.raw_products
+    ) {
+
+      const parts =
+        String(product).split('-');
 
       const productName =
         parts[0]
@@ -355,22 +545,29 @@ async function createVendor(id, extra) {
           .join('-')
           .trim() || '0';
 
-      if (productName) {
-        const productResult =
-          await supabase
-            .from('products')
-            .insert({
-              vendor_id: String(id),
-              name: productName,
-              price: price
-            });
+      if (!productName) {
+        continue;
+      }
 
-        if (productResult.error) {
-          console.log(
-            'Product insert error:',
-            productResult.error.message
-          );
-        }
+      const insertResult =
+        await supabase
+          .from('products')
+          .insert({
+            vendor_id:
+              String(telegramId),
+
+            name:
+              productName,
+
+            price:
+              price
+          });
+
+      if (insertResult.error) {
+        console.log(
+          '[PRODUCTS] insert error:',
+          insertResult.error.message
+        );
       }
     }
   }
@@ -380,32 +577,55 @@ async function createVendor(id, extra) {
 
 
 /* =========================================================
-   TELEGRAM VENDOR MENU
+   VENDOR MENU
 ========================================================= */
 
 function vendorMenu() {
   return Markup.keyboard([
-    ['🏪 Business Name', '📦 Products'],
-    ['💰 Prices', '❓ FAQs'],
-    ['🤖 Assistant Name', '📱 WhatsApp Number'],
-    ['📝 Business Information', '🔗 My Store Link'],
-    ['📊 Dashboard', '⚙️ Settings']
+    [
+      '🏪 Business Name',
+      '📦 Products'
+    ],
+    [
+      '💰 Prices',
+      '❓ FAQs'
+    ],
+    [
+      '🤖 Assistant Name',
+      '📱 WhatsApp Number'
+    ],
+    [
+      '📝 Business Information',
+      '🔗 My Store Link'
+    ],
+    [
+      '📊 Dashboard',
+      '⚙️ Settings'
+    ]
   ])
     .resize();
 }
 
 
 /* =========================================================
-   EXISTING VENDOR HANDLER
+   EXISTING VENDOR RESPONSE
 ========================================================= */
 
-async function handleExistingVendor(ctx, vendor) {
-  const shopName =
-    vendor.shop_name || 'Your business';
+async function showExistingVendor(
+  ctx,
+  vendor
+) {
+  console.log(
+    '[VENDOR] EXISTING VENDOR FOUND:',
+    vendor.telegram_id,
+    vendor.shop_name
+  );
 
   return ctx.reply(
     `Welcome back to CityLords! 🏙️\n\n` +
-    `🏪 Business: ${shopName}\n\n` +
+    `🏪 Business: ${
+      vendor.shop_name || 'Your business'
+    }\n\n` +
     `Your vendor account is already registered.\n` +
     `You do not need to register again.\n\n` +
     `What would you like to manage?`,
@@ -415,458 +635,744 @@ async function handleExistingVendor(ctx, vendor) {
 
 
 /* =========================================================
-   START NEW REGISTRATION
+   START REGISTRATION
 ========================================================= */
 
 async function startRegistration(ctx) {
-  const id = String(ctx.from.id);
 
-  /*
-    VERY IMPORTANT:
-    Always check vendor first.
+  const telegramId =
+    String(ctx.from.id);
 
-    This prevents an already registered vendor from
-    accidentally entering registration again.
-  */
-  const existingVendor = await getVendor(id);
+  console.log(
+    '[START] Telegram ID:',
+    telegramId
+  );
 
-  if (existingVendor) {
-    return handleExistingVendor(ctx, existingVendor);
-  }
 
-  /*
-    If they have an existing onboarding session,
-    continue it instead of starting from scratch.
-  */
-  const existingSession = await getSession(id);
+  /* ---------------------------------------------
+     ALWAYS CHECK VENDOR FIRST
+  --------------------------------------------- */
 
-  if (existingSession) {
-    return ctx.reply(
-      `Welcome back to CityLords! 🏙️\n\n` +
-      `You already started registration.\n` +
-      `Let's continue from where you stopped.`
+  const vendor =
+    await getVendor(telegramId);
+
+  console.log(
+    '[START] Vendor found:',
+    vendor ? 'YES' : 'NO'
+  );
+
+
+  if (vendor) {
+
+    /*
+       CRITICAL:
+
+       Existing vendor wins over everything.
+
+       Even if an old onboarding_sessions row exists,
+       this person is already a vendor.
+    */
+
+    await deleteSession(
+      telegramId
+    );
+
+    return showExistingVendor(
+      ctx,
+      vendor
     );
   }
 
+
+  /* ---------------------------------------------
+     NO VENDOR:
+
+     /start means START CLEANLY.
+
+     Delete any stale onboarding session.
+  --------------------------------------------- */
+
+  const oldSession =
+    await getSession(telegramId);
+
+  console.log(
+    '[START] Old session found:',
+    oldSession ? 'YES' : 'NO'
+  );
+
+
+  if (oldSession) {
+
+    console.log(
+      '[START] Removing stale session.'
+    );
+
+    await deleteSession(
+      telegramId
+    );
+  }
+
+
+  /* ---------------------------------------------
+     Create a fresh registration session
+  --------------------------------------------- */
+
   await setSession(
-    id,
+    telegramId,
     'business_name',
     {
       products: []
     }
   );
 
+  console.log(
+    '[START] New registration started.'
+  );
+
+
   return ctx.reply(
     'Welcome to CityLords! 🏙️\n\n' +
+    'Let\'s register your business.\n\n' +
     'What is your business name?'
   );
 }
 
 
 /* =========================================================
-   TELEGRAM /START
+   /START
 ========================================================= */
 
-bot.start(async (ctx) => {
-  try {
-    return await startRegistration(ctx);
-  } catch (e) {
-    console.log('/start error:', e.message);
+bot.start(
+  async (ctx) => {
 
-    return ctx.reply(
-      'Sorry, something went wrong. Please try again.'
-    );
-  }
-});
+    try {
 
-
-/* =========================================================
-   TELEGRAM /VENDOR123
-========================================================= */
-
-bot.command('vendor123', async (ctx) => {
-  try {
-    return await startRegistration(ctx);
-  } catch (e) {
-    console.log('/vendor123 error:', e.message);
-
-    return ctx.reply(
-      'Sorry, something went wrong. Please try again.'
-    );
-  }
-});
-
-
-/* =========================================================
-   TELEGRAM TEXT HANDLER
-========================================================= */
-
-bot.on('text', async (ctx) => {
-  const id = String(ctx.from.id);
-  const text = String(
-    ctx.message.text || ''
-  ).trim();
-
-  if (!text) return;
-
-  /*
-    Commands are handled above.
-  */
-  if (text.startsWith('/')) {
-    return;
-  }
-
-  try {
-
-    /* =====================================================
-       MOST IMPORTANT CHECK:
-       EXISTING VENDOR ALWAYS COMES FIRST
-    ===================================================== */
-
-    const existingVendor = await getVendor(id);
-
-    if (existingVendor) {
-      /*
-        Existing vendor does NOT enter registration.
-
-        Later, the menu buttons will call the relevant
-        editing functions.
-      */
-      return handleExistingVendor(
-        ctx,
-        existingVendor
+      console.log(
+        '[HANDLER] /start'
       );
-    }
 
+      return await startRegistration(
+        ctx
+      );
 
-    /* =====================================================
-       NO VENDOR YET - CHECK ONBOARDING
-    ===================================================== */
+    } catch (e) {
 
-    let sess = await getSession(id);
-
-    if (!sess) {
-      await setSession(
-        id,
-        'business_name',
-        {
-          products: []
-        }
+      console.log(
+        '[HANDLER] /start ERROR:',
+        e
       );
 
       return ctx.reply(
-        'Welcome to CityLords! 🏙️\n\n' +
-        'What is your business name?'
+        'Sorry, something went wrong. Please try again.'
       );
+    }
+  }
+);
+
+
+/* =========================================================
+   /VENDOR123
+========================================================= */
+
+bot.command(
+  'vendor123',
+  async (ctx) => {
+
+    try {
+
+      console.log(
+        '[HANDLER] /vendor123'
+      );
+
+      return await startRegistration(
+        ctx
+      );
+
+    } catch (e) {
+
+      console.log(
+        '[HANDLER] /vendor123 ERROR:',
+        e
+      );
+
+      return ctx.reply(
+        'Sorry, something went wrong. Please try again.'
+      );
+    }
+  }
+);
+
+
+/* =========================================================
+   NORMAL TEXT
+========================================================= */
+
+bot.on(
+  'text',
+  async (ctx) => {
+
+    const telegramId =
+      String(ctx.from.id);
+
+    const text =
+      String(
+        ctx.message.text || ''
+      ).trim();
+
+
+    if (!text) {
+      return;
     }
 
 
-    let data = sess.data || {};
-    const step = sess.step;
+    /*
+       Commands are handled by their command handlers.
+    */
+
+    if (
+      text.startsWith('/')
+    ) {
+      return;
+    }
 
 
-    /* =====================================================
-       STEP 1 - BUSINESS NAME
-    ===================================================== */
+    try {
 
-    if (step === 'business_name') {
+      console.log(
+        '[TEXT] Telegram ID:',
+        telegramId
+      );
 
-      const proposedName = text;
+      console.log(
+        '[TEXT] Message:',
+        text
+      );
 
-      /*
-        Check whether another vendor already uses this
-        business name.
-      */
-      const existingBusiness =
-        await getVendorByBusinessName(
-          proposedName
+
+      /* ---------------------------------------------
+         MOST IMPORTANT CHECK:
+         IS THIS ALREADY A REGISTERED VENDOR?
+      --------------------------------------------- */
+
+      const vendor =
+        await getVendor(
+          telegramId
         );
 
-      if (existingBusiness) {
+      console.log(
+        '[TEXT] Vendor found:',
+        vendor ? 'YES' : 'NO'
+      );
+
+
+      if (vendor) {
 
         /*
-          If this Telegram ID somehow belongs to the same
-          vendor, welcome them instead.
+           Never send an existing vendor back
+           into registration.
         */
-        if (
-          String(existingBusiness.telegram_id) === id
-        ) {
-          await delSession(id);
 
-          return handleExistingVendor(
-            ctx,
-            existingBusiness
+        await deleteSession(
+          telegramId
+        );
+
+        return showExistingVendor(
+          ctx,
+          vendor
+        );
+      }
+
+
+      /* ---------------------------------------------
+         Get onboarding session
+      --------------------------------------------- */
+
+      const session =
+        await getSession(
+          telegramId
+        );
+
+      console.log(
+        '[TEXT] Session found:',
+        session ? 'YES' : 'NO'
+      );
+
+
+      if (!session) {
+
+        console.log(
+          '[TEXT] No session. Starting registration.'
+        );
+
+        await setSession(
+          telegramId,
+          'business_name',
+          {
+            products: []
+          }
+        );
+
+        return ctx.reply(
+          'Welcome to CityLords! 🏙️\n\n' +
+          'What is your business name?'
+        );
+      }
+
+
+      let data =
+        session.data || {};
+
+      const step =
+        session.step;
+
+
+      console.log(
+        '[TEXT] Current step:',
+        step
+      );
+
+
+      /* =================================================
+         BUSINESS NAME
+      ================================================= */
+
+      if (
+        step === 'business_name'
+      ) {
+
+        const businessName =
+          text;
+
+        console.log(
+          '[NAME] Checking:',
+          businessName
+        );
+
+
+        /*
+           Check whether this business already exists.
+        */
+
+        const existingBusiness =
+          await getVendorByBusinessName(
+            businessName
+          );
+
+
+        console.log(
+          '[NAME] Existing business:',
+          existingBusiness
+            ? 'YES'
+            : 'NO'
+        );
+
+
+        if (existingBusiness) {
+
+          console.log(
+            '[NAME] DUPLICATE BUSINESS:',
+            existingBusiness.shop_name
+          );
+
+
+          /*
+             If it belongs to this Telegram account,
+             recognize the vendor instead.
+          */
+
+          if (
+            String(
+              existingBusiness.telegram_id
+            ) === telegramId
+          ) {
+
+            await deleteSession(
+              telegramId
+            );
+
+            return showExistingVendor(
+              ctx,
+              existingBusiness
+            );
+          }
+
+
+          return ctx.reply(
+            `⚠️ The business name "${businessName}" ` +
+            `is already registered on CityLords.\n\n` +
+            `Please enter another business name.`
           );
         }
 
+
+        /* ---------------------------------------------
+           Save business name
+        --------------------------------------------- */
+
+        data.shop_name =
+          businessName;
+
+
+        await setSession(
+          telegramId,
+          'whatsapp',
+          data
+        );
+
+
         return ctx.reply(
-          `⚠️ The business name "${proposedName}" ` +
-          `is already registered on CityLords.\n\n` +
-          `Please enter a different business name.`
+          `Great! "${businessName}" ✅\n\n` +
+          `What is your WhatsApp number?\n` +
+          `Example: 08012345678`
         );
       }
 
-      data.shop_name = proposedName;
 
-      await setSession(
-        id,
-        'whatsapp',
-        data
-      );
-
-      return ctx.reply(
-        `Great! "${data.shop_name}" ✅\n\n` +
-        `What is your WhatsApp number?\n` +
-        `Example: 08012345678`
-      );
-    }
-
-
-    /* =====================================================
-       STEP 2 - WHATSAPP
-    ===================================================== */
-
-    if (step === 'whatsapp') {
-
-      const normalized = normalizeWa(text);
+      /* =================================================
+         WHATSAPP
+      ================================================= */
 
       if (
-        !normalized ||
-        normalized.length < 10
+        step === 'whatsapp'
       ) {
-        return ctx.reply(
-          'Please enter a valid Nigerian WhatsApp number.\n\n' +
-          'Example: 08012345678'
+
+        const normalized =
+          normalizeWa(text);
+
+
+        if (
+          !normalized ||
+          normalized.length < 10
+        ) {
+
+          return ctx.reply(
+            'Please enter a valid Nigerian WhatsApp number.\n\n' +
+            'Example: 08012345678'
+          );
+        }
+
+
+        data.whatsapp =
+          normalized;
+
+
+        await setSession(
+          telegramId,
+          'category',
+          data
         );
-      }
 
-      data.whatsapp = normalized;
-
-      await setSession(
-        id,
-        'category',
-        data
-      );
-
-      return ctx.reply(
-        `Number ${prettyWa(data.whatsapp)} ✅\n\n` +
-        `Choose your category:`,
-        Markup.keyboard(
-          CATEGORIES.map(c => [c])
-        )
-          .oneTime()
-          .resize()
-      );
-    }
-
-
-    /* =====================================================
-       STEP 3 - CATEGORY
-    ===================================================== */
-
-    if (step === 'category') {
-
-      if (!CATEGORIES.includes(text)) {
 
         return ctx.reply(
-          'Please choose from the list below:',
+          `Number ${prettyWa(normalized)} ✅\n\n` +
+          `Choose your category:`,
           Markup.keyboard(
-            CATEGORIES.map(c => [c])
+            CATEGORIES.map(
+              category => [category]
+            )
           )
             .oneTime()
             .resize()
         );
       }
 
-      data.category = text;
-      data.products = [];
 
-      await setSession(
-        id,
-        'products',
-        data
-      );
-
-      return ctx.reply(
-        `Category: ${text} ✅\n\n` +
-        `Now add your products with prices.\n\n` +
-        `Format:\n` +
-        `Product Name - Price\n\n` +
-        `Example:\n` +
-        `Rice - 5000\n\n` +
-        `Send one product per message.\n` +
-        `Type DONE when finished.`,
-        Markup.removeKeyboard()
-      );
-    }
-
-
-    /* =====================================================
-       STEP 4 - PRODUCTS
-    ===================================================== */
-
-    if (step === 'products') {
+      /* =================================================
+         CATEGORY
+      ================================================= */
 
       if (
-        text.toLowerCase() === 'done'
+        step === 'category'
       ) {
 
-        const count =
-          (data.products || []).length;
-
-        if (count === 0) {
-          return ctx.reply(
-            'Please add at least 1 product first.\n\n' +
-            'Example: Rice - 5000'
-          );
-        }
-
-        /*
-          Final duplicate protection:
-          check Telegram ID again before creating vendor.
-        */
-        const vendorAlreadyExists =
-          await getVendor(id);
-
-        if (vendorAlreadyExists) {
-          await delSession(id);
-
-          return handleExistingVendor(
-            ctx,
-            vendorAlreadyExists
-          );
-        }
-
-        /*
-          Check business name one final time before
-          creating the account.
-        */
-        const duplicateBusiness =
-          await getVendorByBusinessName(
-            data.shop_name
-          );
-
-        if (duplicateBusiness) {
-
-          if (
-            String(
-              duplicateBusiness.telegram_id
-            ) === id
-          ) {
-            await delSession(id);
-
-            return handleExistingVendor(
-              ctx,
-              duplicateBusiness
-            );
-          }
+        if (
+          !CATEGORIES.includes(text)
+        ) {
 
           return ctx.reply(
-            `⚠️ The business name "${data.shop_name}" ` +
-            `has already been registered.\n\n` +
-            `Please restart registration with a different name.`
+            'Please choose from the list below:',
+            Markup.keyboard(
+              CATEGORIES.map(
+                category => [category]
+              )
+            )
+              .oneTime()
+              .resize()
           );
         }
 
-        const vendor =
-          await createVendor(
-            id,
-            {
-              shop_name: data.shop_name,
-              whatsapp: data.whatsapp,
-              category: data.category,
-              product_count: count,
-              raw_products: data.products
-            }
-          );
 
-        await delSession(id);
+        data.category =
+          text;
 
-        const storeLink =
-          `${WEBHOOK_URL}/store/${id}`;
+        data.products =
+          [];
+
+
+        await setSession(
+          telegramId,
+          'products',
+          data
+        );
+
 
         return ctx.reply(
-          `🎉 CityLords registration complete!\n\n` +
-          `🏪 Business: ${vendor.shop_name}\n` +
-          `📂 Category: ${vendor.category}\n` +
-          `📦 Products: ${count}\n\n` +
-          `🔗 Your store link:\n` +
-          `${storeLink}\n\n` +
-          `You can return to CityLords anytime to manage your business.`,
-          vendorMenu()
+          `Category: ${text} ✅\n\n` +
+          `Now add your products with prices.\n\n` +
+          `Format:\n` +
+          `Product Name - Price\n\n` +
+          `Example:\n` +
+          `Rice - 5000\n\n` +
+          `Send one product per message.\n` +
+          `Type DONE when finished.`,
+          Markup.removeKeyboard()
         );
       }
 
 
-      /* Add product */
+      /* =================================================
+         PRODUCTS
+      ================================================= */
 
-      data.products =
-        data.products || [];
+      if (
+        step === 'products'
+      ) {
 
-      data.products.push(text);
+        /* ---------------------------------------------
+           FINISH REGISTRATION
+        --------------------------------------------- */
+
+        if (
+          text.toLowerCase() === 'done'
+        ) {
+
+          const products =
+            data.products || [];
+
+
+          if (
+            products.length === 0
+          ) {
+
+            return ctx.reply(
+              'Please add at least one product first.\n\n' +
+              'Example: Rice - 5000'
+            );
+          }
+
+
+          /* -------------------------------------------
+             FINAL TELEGRAM-ID CHECK
+          ------------------------------------------- */
+
+          const vendorNow =
+            await getVendor(
+              telegramId
+            );
+
+
+          if (vendorNow) {
+
+            await deleteSession(
+              telegramId
+            );
+
+            return showExistingVendor(
+              ctx,
+              vendorNow
+            );
+          }
+
+
+          /* -------------------------------------------
+             FINAL BUSINESS-NAME CHECK
+          ------------------------------------------- */
+
+          const duplicateBusiness =
+            await getVendorByBusinessName(
+              data.shop_name
+            );
+
+
+          if (duplicateBusiness) {
+
+            if (
+              String(
+                duplicateBusiness.telegram_id
+              ) === telegramId
+            ) {
+
+              await deleteSession(
+                telegramId
+              );
+
+              return showExistingVendor(
+                ctx,
+                duplicateBusiness
+              );
+            }
+
+
+            return ctx.reply(
+              `⚠️ The business name "${data.shop_name}" ` +
+              `has already been registered by another vendor.\n\n` +
+              `Please restart with another business name.`
+            );
+          }
+
+
+          /* -------------------------------------------
+             CREATE VENDOR
+          ------------------------------------------- */
+
+          const createdVendor =
+            await createVendor(
+              telegramId,
+              {
+                shop_name:
+                  data.shop_name,
+
+                whatsapp:
+                  data.whatsapp,
+
+                category:
+                  data.category,
+
+                product_count:
+                  products.length,
+
+                raw_products:
+                  products
+              }
+            );
+
+
+          /* -------------------------------------------
+             DELETE REGISTRATION SESSION
+          ------------------------------------------- */
+
+          await deleteSession(
+            telegramId
+          );
+
+
+          const storeLink =
+            `${WEBHOOK_URL}/store/${telegramId}`;
+
+
+          return ctx.reply(
+            `🎉 CityLords registration complete!\n\n` +
+            `🏪 Business: ${createdVendor.shop_name}\n` +
+            `📂 Category: ${createdVendor.category}\n` +
+            `📦 Products: ${products.length}\n\n` +
+            `🔗 Your CityLords store link:\n` +
+            `${storeLink}\n\n` +
+            `You can return anytime to manage your business.`,
+            vendorMenu()
+          );
+        }
+
+
+        /* ---------------------------------------------
+           ADD PRODUCT
+        --------------------------------------------- */
+
+        data.products =
+          data.products || [];
+
+
+        data.products.push(
+          text
+        );
+
+
+        await setSession(
+          telegramId,
+          'products',
+          data
+        );
+
+
+        return ctx.reply(
+          `✅ Added: ${text}\n\n` +
+          `Products added: ${data.products.length}\n\n` +
+          `Send another product or type DONE.`
+        );
+      }
+
+
+      /* =================================================
+         UNKNOWN STEP
+      ================================================= */
+
+      console.log(
+        '[TEXT] Unknown registration step:',
+        step
+      );
+
+
+      /*
+         Instead of getting trapped forever,
+         reset the registration cleanly.
+      */
+
+      await deleteSession(
+        telegramId
+      );
 
       await setSession(
-        id,
-        'products',
-        data
+        telegramId,
+        'business_name',
+        {
+          products: []
+        }
       );
+
 
       return ctx.reply(
-        `✅ Added: ${text}\n\n` +
-        `Products added: ${data.products.length}\n\n` +
-        `Send another product or type DONE.`
+        'Let\'s restart your registration. 🏙️\n\n' +
+        'What is your business name?'
+      );
+
+
+    } catch (e) {
+
+      console.log(
+        '[TEXT HANDLER ERROR]:',
+        e
+      );
+
+
+      return ctx.reply(
+        'Sorry, something went wrong while processing your message.\n\n' +
+        'Please try again.'
       );
     }
-
-
-    /* =====================================================
-       UNKNOWN SESSION STEP
-    ===================================================== */
-
-    await setSession(
-      id,
-      'business_name',
-      {
-        products: []
-      }
-    );
-
-    return ctx.reply(
-      'Let\'s restart your registration.\n\n' +
-      'What is your business name?'
-    );
-
-  } catch (e) {
-
-    console.log(
-      'Telegram text handler error:',
-      e
-    );
-
-    return ctx.reply(
-      'Sorry, something went wrong while processing your message.\n\n' +
-      'Please try again.'
-    );
   }
-});
+);
 
 
 /* =========================================================
-   WHATSAPP SEND FUNCTION
-   Kept ready for later Meta activation
+   WHATSAPP SEND
 ========================================================= */
 
-async function sendWhatsApp(to, message) {
+async function sendWhatsApp(
+  to,
+  message
+) {
 
   if (
     !WHATSAPP_TOKEN ||
     !PHONE_NUMBER_ID
   ) {
+
     console.log(
-      'WhatsApp not configured yet.'
+      '[WHATSAPP] Not configured yet.'
     );
+
     return;
   }
+
 
   try {
 
@@ -874,45 +1380,54 @@ async function sendWhatsApp(to, message) {
       `https://graph.facebook.com/v20.0/` +
       `${PHONE_NUMBER_ID}/messages`;
 
-    const res = await fetch(
-      url,
-      {
-        method: 'POST',
 
-        headers: {
-          'Authorization':
-            `Bearer ${WHATSAPP_TOKEN}`,
+    const response =
+      await fetch(
+        url,
+        {
+          method: 'POST',
 
-          'Content-Type':
-            'application/json'
-        },
+          headers: {
+            'Authorization':
+              `Bearer ${WHATSAPP_TOKEN}`,
 
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
+            'Content-Type':
+              'application/json'
+          },
 
-          to: to,
+          body: JSON.stringify({
+            messaging_product:
+              'whatsapp',
 
-          type: 'text',
+            to:
+              to,
 
-          text: {
-            body: message
-          }
-        })
-      }
-    );
+            type:
+              'text',
 
-    const data =
-      await res.json();
+            text: {
+              body:
+                message
+            }
+          })
+        }
+      );
+
+
+    const result =
+      await response.json();
+
 
     console.log(
-      'WA sent:',
-      data
+      '[WHATSAPP] Send result:',
+      result
     );
+
 
   } catch (e) {
 
     console.log(
-      'WA error:',
+      '[WHATSAPP] Error:',
       e.message
     );
   }
@@ -920,71 +1435,86 @@ async function sendWhatsApp(to, message) {
 
 
 /* =========================================================
-   EXPRESS
+   HOME
 ========================================================= */
 
-app.get('/', (req, res) => {
-  res.send('CityLords LIVE - TEST VERSION');
-});
+app.get(
+  '/',
+  (req, res) => {
+    res.send(
+      'CityLords LIVE - TEST VERSION'
+    );
+  }
+);
 
 
 /* =========================================================
    TELEGRAM WEBHOOK
 ========================================================= */
 
-app.post('/webhook', async (req, res) => {
+app.post(
+  '/webhook',
+  async (req, res) => {
 
-  /*
-    CRITICAL FIX:
+    const update =
+      req.body;
 
-    Telegram gets HTTP 200 immediately.
 
-    This prevents Telegram from waiting for Supabase/Telegram
-    processing and retrying the same update.
-  */
-  res.sendStatus(200);
+    /*
+       LOG EVERYTHING FIRST
+    */
 
-  const update = req.body;
+    logUpdate(update);
 
-  /*
-    Ignore duplicate Telegram updates.
-  */
-  if (
-    update &&
-    update.update_id !== undefined
-  ) {
 
-    const isNew =
-      rememberTelegramUpdate(
-        update.update_id
-      );
+    /*
+       ACKNOWLEDGE TELEGRAM IMMEDIATELY.
 
-    if (!isNew) {
+       This helps prevent Telegram from waiting for
+       database operations.
+    */
+
+    res.sendStatus(200);
+
+
+    /*
+       DUPLICATE UPDATE CHECK
+    */
+
+    if (
+      isDuplicateUpdate(
+        update?.update_id
+      )
+    ) {
 
       console.log(
-        'Duplicate Telegram update ignored:',
+        '[TELEGRAM] DUPLICATE UPDATE IGNORED:',
         update.update_id
       );
 
       return;
     }
+
+
+    /*
+       Process Telegram update AFTER HTTP 200.
+    */
+
+    try {
+
+      await bot.handleUpdate(
+        update
+      );
+
+    } catch (e) {
+
+      console.log(
+        '[TELEGRAM] WEBHOOK PROCESSING ERROR:',
+        e
+      );
+    }
   }
-
-  /*
-    Process after acknowledging Telegram.
-  */
-  try {
-
-    await bot.handleUpdate(update);
-
-  } catch (e) {
-
-    console.log(
-      'Telegram webhook processing error:',
-      e
-    );
-  }
-});
+);
 
 
 /* =========================================================
@@ -1004,19 +1534,21 @@ app.get(
     const challenge =
       req.query['hub.challenge'];
 
+
     if (
       mode === 'subscribe' &&
       token === VERIFY_TOKEN
     ) {
 
       console.log(
-        'WhatsApp webhook verified.'
+        '[WHATSAPP] Webhook verified.'
       );
 
       return res
         .status(200)
         .send(challenge);
     }
+
 
     return res.sendStatus(403);
   }
@@ -1025,7 +1557,6 @@ app.get(
 
 /* =========================================================
    WHATSAPP WEBHOOK
-   Ready for later Meta activation
 ========================================================= */
 
 app.post(
@@ -1033,84 +1564,113 @@ app.post(
   async (req, res) => {
 
     /*
-      Acknowledge Meta immediately.
+       Acknowledge Meta immediately.
     */
+
     res.sendStatus(200);
+
 
     try {
 
-      const body = req.body;
+      const body =
+        req.body;
+
 
       if (
         !body ||
-        body.object !== 'whatsapp_business_account'
+        body.object !==
+          'whatsapp_business_account'
       ) {
         return;
       }
 
+
       const entries =
         body.entry || [];
 
-      for (const entry of entries) {
+
+      for (
+        const entry
+        of entries
+      ) {
 
         const changes =
           entry.changes || [];
 
-        for (const change of changes) {
+
+        for (
+          const change
+          of changes
+        ) {
 
           const value =
             change.value;
 
-          if (!value) continue;
+
+          if (!value) {
+            continue;
+          }
+
 
           const messages =
             value.messages || [];
 
-          for (const message of messages) {
+
+          for (
+            const message
+            of messages
+          ) {
 
             const from =
               message.from;
 
             const text =
-              message.text?.body || '';
+              message.text?.body ||
+              '';
 
-            if (!from || !text) {
+
+            if (
+              !from ||
+              !text
+            ) {
               continue;
             }
 
+
             console.log(
-              'WhatsApp message:',
+              '[WHATSAPP] Message:',
               from,
               text
             );
 
 
-            /* ---------------------------------------------
-               Vendor routing
+            let vendorId =
+              null;
 
-               Supports the new CityLords marker:
-               CL_VENDOR_123456
-
-               Also supports the old:
-               STORE_123456
-            --------------------------------------------- */
-
-            let vendorId = null;
 
             const newMatch =
               text.match(
                 /CL_VENDOR_(\d+)/
               );
 
+
             const oldMatch =
               text.match(
                 /STORE_(\d+)/
               );
 
+
             if (newMatch) {
-              vendorId = newMatch[1];
-            } else if (oldMatch) {
-              vendorId = oldMatch[1];
+
+              vendorId =
+                newMatch[1];
+
+            } else if (
+              oldMatch
+            ) {
+
+              vendorId =
+                oldMatch[1];
             }
 
 
@@ -1120,6 +1680,7 @@ app.post(
                 await getVendor(
                   vendorId
                 );
+
 
               if (!vendor) {
 
@@ -1131,26 +1692,17 @@ app.post(
                 continue;
               }
 
-              /*
-                Basic welcome for now.
 
-                Full AI customer assistant will be connected
-                after Meta/WhatsApp activation and testing.
-              */
               await sendWhatsApp(
                 from,
                 `Welcome to ${vendor.shop_name}! 👋\n\n` +
-                `You are now connected through CityLords.\n\n` +
+                `You are connected through CityLords.\n\n` +
                 `How can we help you today?`
               );
 
+
             } else {
 
-              /*
-                No vendor marker found.
-
-                We do not guess a vendor.
-              */
               await sendWhatsApp(
                 from,
                 `Welcome to CityLords! 🏙️\n\n` +
@@ -1165,7 +1717,7 @@ app.post(
     } catch (e) {
 
       console.log(
-        'WhatsApp webhook error:',
+        '[WHATSAPP] Webhook error:',
         e
       );
     }
@@ -1174,7 +1726,7 @@ app.post(
 
 
 /* =========================================================
-   CUSTOMER STORE LINK
+   STORE LINK
 ========================================================= */
 
 app.get(
@@ -1183,13 +1735,18 @@ app.get(
 
     try {
 
-      const id =
+      const telegramId =
         String(req.params.id);
 
+
       const vendor =
-        await getVendor(id);
+        await getVendor(
+          telegramId
+        );
+
 
       if (!vendor) {
+
         return res
           .status(404)
           .send(
@@ -1197,20 +1754,7 @@ app.get(
           );
       }
 
-      /*
-        Generic CityLords marker.
 
-        It does NOT depend on whether the business is called:
-        Store, Enterprise, Boutique, Company, Hub, etc.
-      */
-      const msg =
-        `CL_VENDOR_${vendor.telegram_id} ` +
-        `Hi ${vendor.shop_name}, I found you on CityLords.`;
-
-      /*
-        CITYLORDS_WA should contain the CityLords WhatsApp
-        number in international format.
-      */
       if (!CITYLORDS_WA) {
 
         return res
@@ -1220,18 +1764,44 @@ app.get(
           );
       }
 
+
+      /*
+         The business name does NOT control routing.
+
+         Therefore it doesn't matter whether the business
+         is called:
+
+         Store
+         Enterprise
+         Boutique
+         Company
+         Hub
+         Services
+         etc.
+      */
+
+      const message =
+        `CL_VENDOR_${vendor.telegram_id} ` +
+        `Hi ${vendor.shop_name}, I found you on CityLords.`;
+
+
       const link =
         `https://wa.me/${CITYLORDS_WA}` +
-        `?text=${encodeURIComponent(msg)}`;
+        `?text=${encodeURIComponent(message)}`;
 
-      return res.redirect(link);
+
+      return res.redirect(
+        link
+      );
+
 
     } catch (e) {
 
       console.log(
-        '/store error:',
+        '[STORE LINK] Error:',
         e.message
       );
+
 
       return res
         .status(500)
@@ -1244,7 +1814,7 @@ app.get(
 
 
 /* =========================================================
-   BASIC ADMIN
+   ADMIN
 ========================================================= */
 
 app.get(
@@ -1264,6 +1834,7 @@ app.get(
             }
           );
 
+
       if (result.error) {
 
         return res
@@ -1274,37 +1845,69 @@ app.get(
           );
       }
 
+
       const vendors =
         result.data || [];
+
 
       let html =
         '<h1>CityLords Vendors</h1>';
 
+
       html +=
         `<p>Total vendors: ${vendors.length}</p>`;
 
-      html += '<hr>';
 
-      for (const vendor of vendors) {
+      html +=
+        '<hr>';
+
+
+      for (
+        const vendor
+        of vendors
+      ) {
 
         html +=
           `<div style="margin-bottom:20px;">` +
-          `<strong>${vendor.shop_name || ''}</strong><br>` +
-          `Telegram: ${vendor.telegram_id || ''}<br>` +
-          `Category: ${vendor.category || ''}<br>` +
-          `WhatsApp: ${vendor.whatsapp_display || vendor.whatsapp || ''}<br>` +
-          `Products: ${vendor.product_count || 0}` +
+
+          `<strong>${
+            vendor.shop_name || ''
+          }</strong><br>` +
+
+          `Telegram: ${
+            vendor.telegram_id || ''
+          }<br>` +
+
+          `Category: ${
+            vendor.category || ''
+          }<br>` +
+
+          `WhatsApp: ${
+            vendor.whatsapp_display ||
+            vendor.whatsapp ||
+            ''
+          }<br>` +
+
+          `Products: ${
+            vendor.product_count || 0
+          }` +
+
           `</div>`;
       }
 
-      return res.send(html);
+
+      return res.send(
+        html
+      );
+
 
     } catch (e) {
 
       console.log(
-        '/admin error:',
+        '[ADMIN] Error:',
         e.message
       );
+
 
       return res
         .status(500)
@@ -1325,49 +1928,58 @@ app.listen(
   async () => {
 
     console.log(
-      `CityLords server running on port ${PORT}`
+      '======================================'
     );
+
+    console.log(
+      'CITYLORDS TEST SERVER STARTED'
+    );
+
+    console.log(
+      'Port:',
+      PORT
+    );
+
+    console.log(
+      '======================================'
+    );
+
 
     try {
 
       if (WEBHOOK_URL) {
 
-        /*
-          Render deployment:
-          use Telegram webhook.
-        */
-
         await bot.telegram.setWebhook(
           WEBHOOK_URL + '/webhook'
         );
 
+
         console.log(
-          'Telegram webhook set:',
+          '[TELEGRAM] Webhook:',
           WEBHOOK_URL + '/webhook'
         );
 
+
       } else {
 
-        /*
-          Local development:
-          clear webhook and use polling.
-        */
-
         await bot.telegram.deleteWebhook();
+
 
         await bot.launch({
           dropPendingUpdates: true
         });
 
+
         console.log(
-          'Telegram bot running with polling.'
+          '[TELEGRAM] Polling mode active.'
         );
       }
+
 
     } catch (e) {
 
       console.log(
-        'Telegram startup error:',
+        '[TELEGRAM] Startup error:',
         e.message
       );
     }
@@ -1376,15 +1988,20 @@ app.listen(
 
 
 /* =========================================================
-   GRACEFUL SHUTDOWN
+   SHUTDOWN
 ========================================================= */
 
 process.once(
   'SIGINT',
-  () => bot.stop('SIGINT')
+  () => {
+    bot.stop('SIGINT');
+  }
 );
+
 
 process.once(
   'SIGTERM',
-  () => bot.stop('SIGTERM')
+  () => {
+    bot.stop('SIGTERM');
+  }
 );
